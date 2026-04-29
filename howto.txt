@@ -3,15 +3,25 @@
 ================================================================
 
 【構成】
-  クライアント (ローカルPC)
-    └─ test_demo.py
+  ROS PC (Linux, RealSense + ROS1 + ロボット接続)
+    └─ ros/rgbd_server.py  ← RGBD を HTTP で提供 + 手首座標を ROS にパブリッシュ
+          ↓ HTTP :5000 (RGBD送信 / 手首座標受信)
+  Client PC (Windows, GPU なし)
+    └─ client/grasp_pipeline.py  ← 姿勢推定依頼 + 把持姿勢生成 + 手首座標送信
           ↓ HTTP :8080
-  サーバ (計算機 10.40.1.126)
-    ├─ server.py          (SAM-3D, ポート 8080)
+  GPU サーバ (計算機 10.40.1.126)
+    ├─ server.py          (SAM-3D + SAM-6D, ポート 8080)
     └─ sam6d Docker       (SAM-6D, ポート 8081, server.py が内部呼び出し)
 
+  データフロー:
+    ROS PC → [RGBD] → Client PC → [RGBD] → GPU サーバ
+                                          ← [R, t, points]
+                                  → GraspGenerator
+    ROS PC ← [hand[0] xyz] ← Client PC
+    /wrist_left, /wrist_right (geometry_msgs/PointStamped)
+
 ================================================================
- STEP 1: サーバ側 — SAM-6D Docker を起動
+ STEP 1: GPU サーバ側 — SAM-6D Docker を起動
 ================================================================
 
   cd /home/okada/ws/project/server
@@ -46,62 +56,53 @@
       > server.log 2>&1 &
 
 ================================================================
- STEP 3: クライアント側 — 実行
+ STEP 3: ROS PC 側 — RGBD HTTP サーバを起動
 ================================================================
 
-  cd /home/okada/ws/project/client
+  # 依存インストール (初回のみ)
+  pip install flask pyrealsense2 opencv-python numpy
 
-  # メッシュ生成 + 姿勢推定を一括実行 (推奨)
-  python test_demo.py --mode full \
-      --rgb   test_data/rgb.png \
-      --depth test_data/depth.png \
-      --click-x 400 --click-y 280 \
-      --no-show --skip-grasp
+  # 起動 (ROS 環境に source してから)
+  source /opt/ros/noetic/setup.bash
+  cd <このリポジトリ>/ros
+  python rgbd_server.py --port 5000
 
-  # 出力画像
-  #   output/test/pose_check_mesh.png  … メッシュレンダリング
-  #   output/test/pose_check_pts.png   … 点群+bbox投影
+  # ヘルスチェック
+  curl http://localhost:5000/health
+  # → {"camera_ready": true, "status": "ok"} が返れば OK
 
-================================================================
- オプション説明
-================================================================
-
-  --click-x / --click-y
-      物体を指定するクリック座標。省略すると画面クリックで選択。
-
-  --no-show
-      cv2.imshow を使わない (ヘッドレス環境・SSH環境用)。
-      画像はファイルに保存される。
-
-  --skip-grasp
-      Shape2Gesture による把持姿勢生成をスキップ。
-      姿勢推定の確認だけしたい場合に使う。
-
-  --depth-scale
-      深度画像のスケール係数。
-        0.001 … uint16 mm PNG (デフォルト)
-        1.0   … すでにメートル単位
-
-  --fx / --fy / --cx / --cy
-      カメラ内部パラメータ。config.yaml の値が使われるが上書き可能。
+  # パブリッシュされる ROS トピック
+  rostopic echo /wrist_left   # geometry_msgs/PointStamped
+  rostopic echo /wrist_right
 
 ================================================================
- ステップを分けて実行したい場合
+ STEP 4: Client PC 側 — 把持パイプライン実行
 ================================================================
 
-  # Step A: メッシュ生成のみ
-  python test_demo.py --mode offline-mesh \
-      --rgb test_data/rgb.png \
-      --click-x 400 --click-y 280
+  cd <このリポジトリ>/client
 
-  # Step B: 姿勢推定のみ (Step A の出力を使う)
-  python test_demo.py --mode online \
-      --rgb   test_data/rgb.png \
-      --depth test_data/depth.png \
-      --mesh  meshes/test_object.ply \
-      --server-mesh-path "/home/okada/ws/project/tmp/server_reconstructions/object_seed42_mesh.ply" \
-      --template-dir     "/home/okada/ws/project/tmp/server_reconstructions/object_seed42_mesh_templates" \
-      --no-show --skip-grasp
+  # 実行 (物体の中心付近をクリック座標で指定)
+  python grasp_pipeline.py \
+      --ros-pc     http://<ROS_PC_IP>:5000 \
+      --gpu-server http://10.40.1.126:8080 \
+      --click-x 320 --click-y 240
+
+  # オプション説明
+  #   --ros-pc      ROS PC の IP アドレスとポート  [必須]
+  #   --gpu-server  GPU サーバの URL              [デフォルト: http://10.40.1.126:8080]
+  #   --click-x/y   物体クリック座標               [-1 で未指定 (画像中央を使用)]
+  #   --num-samples 生成する把持候補数              [デフォルト: 1]
+  #   --epoch       PositionVAE エポック番号       [デフォルト: 69]
+  #   --model-dir   Shape2Gesture モデルディレクトリ [デフォルト: save_model]
+
+================================================================
+ 出力 (ROS PC 側 ROS トピック)
+================================================================
+
+  /wrist_left   geometry_msgs/PointStamped  左手首位置 (カメラ座標系 [m])
+  /wrist_right  geometry_msgs/PointStamped  右手首位置 (カメラ座標系 [m])
+
+  header.frame_id = "camera_color_optical_frame"
 
 ================================================================
  サーバ側パスまとめ
