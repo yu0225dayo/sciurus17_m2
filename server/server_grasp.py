@@ -224,6 +224,8 @@ async def estimate_and_generate_grasp(
         click_x=click_x,
         click_y=click_y,
         seed=seed,
+        target_points=2048,
+        output_dir="",
         mesh_method=mesh_method,
         object_size_mm=object_size_mm,
     )
