@@ -1,34 +1,32 @@
 #!/usr/bin/env python3
 """
-sciurus17 把持コントロールパネル (tkinter GUI)
+sciurus17 把持コントロールパネル (tkinter GUI) — メインモード
 
 ボタン1クリックで全工程を操作できる統合GUI。
 カメラ映像を表示し、クリックで物体選択→計算機送信→把持推定→アーム移動まで対応。
 
 起動:
   # 実機モード (ROS2 + sciurus17_ros 必須)
-  python3 ros/sciurus17_gui.py --server-url http://10.40.1.126:8080
+  python3 ros/sciurus17_gui_main.py --server-url http://10.40.1.126:8080
 
-  # モックモード (ROS2 不要・GUI テスト用)
-  python3 ros/sciurus17_gui.py --mock
-  python3 ros/sciurus17_gui.py --mock --mock-image client/saved_data/test_20260422_200416
+  # デモモード (ROS2 不要・GUI テスト用)
+  python3 ros/sciurus17_gui_main.py --demo
+  python3 ros/sciurus17_gui_main.py --demo --demo-image client/saved_data/test_20260422_200416
 
 操作フロー:
-  1. [sciurus17 起動] で ROS ノードを起動  (モック時はスキップ可)
+  1. [sciurus17 起動] で ROS ノードを起動  (デモ時はスキップ可)
   2. [カメラ接続] でカメラ映像表示開始
   3. [フレーム取得] で映像を凍結
-  4. 凍結映像をクリックして物体選択
-  5. [計算機へ送信・姿勢推定] でメッシュ生成 + 6DoF pose 推定
-  6. [把持姿勢生成] で Shape2Gesture 実行 → hand[0] → TF 変換
-  7. [両アームを移動] で MoveItPy グラスプ実行
+  4. [頭部制御] で首を指定角度に傾ける → 重力方向が自動計算される
+  5. 凍結映像をクリックして物体選択
+  6. [計算機へ送信・姿勢推定] でメッシュ生成 + 6DoF pose 推定
+  7. [把持姿勢生成] で Shape2Gesture 実行 → hand[0] → TF 変換
+  8. [両アームを移動] または [左/右アームのみ移動] で MoveItPy グラスプ実行
 
 依存:
   pip install Pillow opencv-python numpy
   (実機モードのみ) ROS2 + MoveIt2 + sciurus17_ros + requests + torch
 """
-
-# ファイル: ros/sciurus17_gui_demo.py  (デモ用 — ROS2/実機不要)
-# 実機実行は ros/sciurus17_gui_main.py を使用してください。
 
 import argparse
 import math
@@ -79,8 +77,8 @@ except ImportError:
     pass
 
 # ── client/ モジュール (省略可能) ─────────────────────────────────────────────
-_SERVER_OK = False   # サーバ通信 (SAM6DClient + coord_transform) — requests/numpy のみ
-_GRASP_OK  = False   # 把持生成 (GraspGenerator) — torch 必須
+_SERVER_OK = False
+_GRASP_OK  = False
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "client"))
@@ -234,13 +232,12 @@ def _draw_hand_skeleton(rgb_bgr: np.ndarray, lh_cam: np.ndarray,
 class VisualizationWindow:
     """
     パイプライン各ステップの画像を常時表示する4パネルウィンドウ。
-    起動時に作成し、各ステップ完了ごとに対応パネルを更新する。
 
       [ カメラ映像  ] [ 物体選択     ]
       [ 姿勢推定結果 ] [ 把持姿勢結果 ]
     """
 
-    PW, PH = 320, 240   # 各パネルのピクセルサイズ
+    PW, PH = 320, 240
 
     _PANELS = [
         ("camera", "カメラ映像",   0, 0),
@@ -266,14 +263,12 @@ class VisualizationWindow:
                      font=("Helvetica", 9, "bold")).pack(anchor="w")
             c = tk.Canvas(frame, width=self.PW, height=self.PH, bg="#111111")
             c.pack()
-            # "待機中" テキストを初期表示
             c.create_text(self.PW // 2, self.PH // 2, text="待機中",
                           fill="#444444", font=("Helvetica", 12))
             self._canvases[key] = c
             self._tk_imgs[key]  = None
 
     def _show(self, key: str, bgr: np.ndarray):
-        """BGRイメージをリサイズしてパネルに描画する（スレッドセーフでない — after() 経由で呼ぶ）。"""
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         h, w = rgb.shape[:2]
         scale = min(self.PW / w, self.PH / h)
@@ -284,20 +279,16 @@ class VisualizationWindow:
         x0 = (self.PW - nw) // 2
         pad[y0:y0+nh, x0:x0+nw] = rgb
         tk_img = ImageTk.PhotoImage(Image.fromarray(pad))
-        self._tk_imgs[key] = tk_img          # GC 防止
+        self._tk_imgs[key] = tk_img
         c = self._canvases[key]
         c.delete("all")
         c.create_image(0, 0, anchor="nw", image=tk_img)
 
-    # ── 各パネル更新 API ─────────────────────────────────────────────────────
-
     def update_camera(self, bgr: np.ndarray):
-        """カメラ映像パネルをライブ更新（_poll_live から呼ぶ）。"""
         self._show("camera", bgr)
 
     def update_frozen(self, bgr: np.ndarray,
                       click_x: int = -1, click_y: int = -1):
-        """物体選択パネル: 凍結フレーム + クリックマーカーを表示。"""
         img = bgr.copy()
         if click_x >= 0:
             cv2.circle(img, (click_x, click_y), 14, (80, 80, 255), 2, cv2.LINE_AA)
@@ -308,7 +299,6 @@ class VisualizationWindow:
 
     def update_pose(self, bgr: np.ndarray, R: np.ndarray,
                     t: np.ndarray, intr):
-        """姿勢推定結果パネル: 座標軸オーバーレイ + t/R テキスト。"""
         img = _draw_pose_axes(bgr, R, t, intr)
         t_txt = f"t [{t[0]:+.3f} {t[1]:+.3f} {t[2]:+.3f}]"
         cv2.putText(img, t_txt, (6, img.shape[0] - 8),
@@ -317,7 +307,6 @@ class VisualizationWindow:
 
     def update_grasp(self, bgr: np.ndarray, lh_cam: np.ndarray,
                      rh_cam: np.ndarray, intr):
-        """把持姿勢結果パネル: 手の骨格 (23関節) 投影 + 手首座標テキスト。"""
         lh_cam = np.asarray(lh_cam, dtype=np.float64)
         rh_cam = np.asarray(rh_cam, dtype=np.float64)
         img = _draw_hand_skeleton(bgr, lh_cam, rh_cam, intr)
@@ -427,24 +416,23 @@ if _ROS2_OK:
             return _plan_and_execute(robot, arm_comp, self.get_logger().error, params)
 
 
-# ── モックノード (ROS2 不要) ───────────────────────────────────────────────────
+# ── デモノード (ROS2 不要) ────────────────────────────────────────────────────
 
 class DemoRobotNode:
     """
     デモ用ノード。ROS2 なしで動作する。
-    - カメラ: ウェブカム → 保存画像 (rgb.png/depth.png/cam.json) → 単色フォールバック
+    - カメラ: ウェブカム → 保存画像 → 単色フォールバック
     - TF2: 固定オフセットで代替
-    - アーム制御: ログ出力のみ（実際には動かない）
+    - アーム/頭部制御: ログ出力のみ
     """
 
     def __init__(self, mock_image_dir: str | None = None):
         self._lock      = threading.Lock()
         self._rgb       = None
-        self._depth_mm  = None   # uint16 depth in mm
-        self._cam_json  = None   # dict from cam.json
+        self._depth_mm  = None
+        self._cam_json  = None
         self._cap       = None
 
-        # 1. ウェブカム
         cap = cv2.VideoCapture(0)
         if cap.isOpened():
             self._cap = cap
@@ -452,7 +440,6 @@ class DemoRobotNode:
             return
         cap.release()
 
-        # 2. 指定フォルダの rgb.png / depth.png / cam.json
         dirs_to_try = []
         if mock_image_dir:
             dirs_to_try.append(mock_image_dir)
@@ -471,21 +458,16 @@ class DemoRobotNode:
                     with self._lock:
                         self._rgb = img
                     print(f"[Demo] テスト画像: {p}")
-                    # depth.png
                     dp = os.path.join(d, "depth.png")
                     if os.path.exists(dp):
                         self._depth_mm = cv2.imread(dp, cv2.IMREAD_ANYDEPTH)
-                        print(f"[Demo] 深度画像: {dp}")
-                    # cam.json
                     import json
                     cp = os.path.join(d, "cam.json")
                     if os.path.exists(cp):
                         with open(cp) as f:
                             self._cam_json = json.load(f)
-                        print(f"[Demo] カメラ情報: {cp}")
                     return
 
-        # 3. 単色フォールバック
         self._rgb = np.zeros((480, 640, 3), dtype=np.uint8)
         self._rgb[:] = (50, 50, 80)
         cv2.putText(self._rgb, "Mock Camera — No Image Found",
@@ -508,7 +490,6 @@ class DemoRobotNode:
         rgb = self.get_latest_rgb()
         h, w = rgb.shape[:2] if rgb is not None else (480, 640)
 
-        # 保存済み深度があれば使用、なければランダムノイズ
         if self._depth_mm is not None:
             dep = self._depth_mm
         else:
@@ -530,21 +511,11 @@ class DemoRobotNode:
         return rgb, dep, intr
 
     def camera_to_base(self, xyz_cam, camera_frame, base_frame) -> np.ndarray:
-        """モック: カメラ座標に固定オフセットを加えてロボット座標として返す。"""
         return xyz_cam + np.array([0.30, 0.0, 0.20])
 
     def move_arm(self, robot, arm_comp, params, xyz_base, pose_link, orientation) -> bool:
-        """モック: 実際には動かさずログのみ。"""
         time.sleep(0.5)
         return True
-
-    def get_gravity(self) -> np.ndarray | None:
-        """cam.json の gravity フィールドからカメラ座標系の重力方向ベクトルを返す。"""
-        if self._cam_json and "gravity" in self._cam_json:
-            g = np.array(self._cam_json["gravity"], dtype=np.float32)
-            norm = np.linalg.norm(g)
-            return g / norm if norm > 1e-6 else None
-        return None
 
     def __del__(self):
         if self._cap is not None:
@@ -571,7 +542,7 @@ class SciurusGUI:
         self._scale_x = self._scale_y = 1.0
 
         self._mesh_path: str | None      = None
-        self._sam6d_client               = None   # _do_estimate() で生成・保存
+        self._sam6d_client               = None
         self._R: np.ndarray | None       = None
         self._t: np.ndarray | None       = None
         self._gravity: np.ndarray | None = None
@@ -590,10 +561,10 @@ class SciurusGUI:
 
         if args.demo:
             self._log(f"[モード] デモモード — カメラ:保存画像 / 推定:実サーバ {args.server_url}")
-            self._init_gravity_demo()
         else:
             self._log("[モード] メインモード — sciurus17 実機")
-            self._on_neck_pitch_change()
+        # 首ピッチ角から常に重力方向を計算してセット
+        self._on_neck_pitch_change()
 
         self._refresh_ui()
         self._open_vis_win()
@@ -601,54 +572,39 @@ class SciurusGUI:
         self._poll_log()
 
     def _open_vis_win(self):
-        """起動時に可視化ウィンドウを作成する。"""
         self._vis_win = VisualizationWindow(self.root)
 
-    def _init_gravity_demo(self):
-        """デモモード: cam.json の gravity を読み込んで self._gravity にセットする。"""
-        g = self.node.get_gravity() if hasattr(self.node, "get_gravity") else None
-        if g is not None:
-            self._gravity = g
-            txt = f"[{g[0]:+.3f}  {g[1]:+.3f}  {g[2]:+.3f}]"
-            self._log(f"[重力] cam.json IMU gravity={g.round(3)}")
-        else:
-            self._gravity = None
-            txt = "なし (デフォルト補正)"
-            self._log("[重力] cam.json に gravity なし。デフォルト補正を使用")
-        if self._lbl_gravity is not None:
-            self._lbl_gravity.config(text=txt)
-
     def _on_neck_pitch_change(self, *_):
-        """メインモード: 首ピッチ角から重力方向を計算して self._gravity にセットする。"""
-        if self._neck_pitch_var is None:
-            return
+        """首ピッチ角から重力方向を計算して self._gravity にセットし、ラベルを更新する。"""
         pitch = self._neck_pitch_var.get()
         self._gravity = _gravity_from_neck_pitch(pitch)
-        self._log(f"[重力] 首ピッチ {pitch:.1f}° → gravity={self._gravity.round(3)}")
+        g = self._gravity
+        txt = f"[{g[0]:+.3f}  {g[1]:+.3f}  {g[2]:+.3f}]"
+        if self._lbl_gravity is not None:
+            self._lbl_gravity.config(text=txt)
+        self._log(f"[重力] 首ピッチ {pitch:.1f}° → gravity={g.round(3)}")
 
     # ──────────────────────── UI 構築 ──────────────────────────────────────────
 
     def _build_ui(self):
         root = self.root
         if self.args.demo:
-            _mode_tag = "  [DEMO]"
             title_color = "#ffcc44"
             title_text  = "sciurus17 把持コントロールパネル  【デモモード】"
+            root.title("sciurus17 把持コントロールパネル  [DEMO]")
         else:
-            _mode_tag = "  [MAIN]"
             title_color = "white"
             title_text  = "sciurus17 把持コントロールパネル  【メインモード】"
-        root.title("sciurus17 把持コントロールパネル" + _mode_tag)
+            root.title("sciurus17 把持コントロールパネル  [MAIN]")
         root.configure(bg=BG)
         root.resizable(False, False)
 
-        # タイトル
         tk.Label(root, text=title_text,
                  font=("Helvetica", 13, "bold"), bg=BG, fg=title_color,
                  ).grid(row=0, column=0, columnspan=2, pady=(8, 2), padx=10, sticky="ew")
 
         # ── 左: ボタンパネル ──
-        left = tk.Frame(root, bg=BG, width=270)
+        left = tk.Frame(root, bg=BG, width=280)
         left.grid(row=1, column=0, sticky="ns", padx=(8, 4), pady=4)
         left.grid_propagate(False)
 
@@ -669,54 +625,78 @@ class SciurusGUI:
             self._btns[key] = b
             return b
 
+        # ── 1. 起動 ──
         f1 = section("1. 起動")
         add_btn(f1, "▶  sciurus17 起動", self._on_launch, "launch", color="#3d6b3d")
         add_btn(f1, "■  sciurus17 停止", self._on_kill,   "kill",   color="#6b3d3d")
 
+        # ── 2. カメラ ──
         f2 = section("2. カメラ")
         add_btn(f2, "▶  カメラ接続",    self._on_connect_camera, "cam_connect")
         add_btn(f2, "フレーム取得",      self._on_capture,        "capture")
 
-        # 重力方向入力: デモ=cam.json から表示、メイン=首ピッチ角スピンボックス
-        if self.args.demo:
-            grav_row = tk.Frame(f2, bg=PANEL_BG)
-            grav_row.pack(fill=tk.X, pady=2)
-            tk.Label(grav_row, text="重力(IMU):", bg=PANEL_BG, fg="#aaaaaa",
-                     font=("Helvetica", 8)).pack(side=tk.LEFT)
-            self._lbl_gravity = tk.Label(grav_row, text="読込み中...",
-                                          bg=PANEL_BG, fg="#88aaff",
-                                          font=("Courier", 8))
-            self._lbl_gravity.pack(side=tk.LEFT, padx=4)
-            self._neck_pitch_var = None  # デモモードでは不使用
-        else:
-            neck_row = tk.Frame(f2, bg=PANEL_BG)
-            neck_row.pack(fill=tk.X, pady=2)
-            tk.Label(neck_row, text="首ピッチ角[deg]:", bg=PANEL_BG, fg="#aaaaaa",
-                     font=("Helvetica", 8)).pack(side=tk.LEFT)
-            self._neck_pitch_var = tk.DoubleVar(value=getattr(self.args, "neck_pitch", 0.0))
-            neck_spin = tk.Spinbox(
-                neck_row, textvariable=self._neck_pitch_var,
-                from_=-90.0, to=90.0, increment=5.0, width=6,
-                bg=BTN_BG, fg=BTN_FG, font=("Helvetica", 9),
-                command=self._on_neck_pitch_change,
-            )
-            neck_spin.pack(side=tk.LEFT, padx=4)
-            tk.Label(neck_row, text="(下向き+)", bg=PANEL_BG, fg="#666666",
-                     font=("Helvetica", 8)).pack(side=tk.LEFT)
-            self._lbl_gravity = None
+        # ── 3. 頭部制御 ──
+        f3 = section("3. 頭部制御")
 
-        f3 = section("3. 姿勢推定")
-        tk.Label(f3, text="↑ 画像をクリックして物体選択",
+        # ヨー行
+        yaw_row = tk.Frame(f3, bg=PANEL_BG)
+        yaw_row.pack(fill=tk.X, pady=2)
+        tk.Label(yaw_row, text="ヨー[deg]:", bg=PANEL_BG, fg="#aaaaaa",
+                 font=("Helvetica", 8)).pack(side=tk.LEFT)
+        self._neck_yaw_var = tk.DoubleVar(value=0.0)
+        tk.Spinbox(
+            yaw_row, textvariable=self._neck_yaw_var,
+            from_=-90.0, to=90.0, increment=5.0, width=6,
+            bg=BTN_BG, fg=BTN_FG, font=("Helvetica", 9),
+        ).pack(side=tk.LEFT, padx=4)
+        tk.Label(yaw_row, text="(左+)", bg=PANEL_BG, fg="#666666",
+                 font=("Helvetica", 8)).pack(side=tk.LEFT)
+
+        # ピッチ行 (重力計算・高さ計測に連動)
+        pitch_row = tk.Frame(f3, bg=PANEL_BG)
+        pitch_row.pack(fill=tk.X, pady=2)
+        tk.Label(pitch_row, text="ピッチ[deg]:", bg=PANEL_BG, fg="#aaaaaa",
+                 font=("Helvetica", 8)).pack(side=tk.LEFT)
+        self._neck_pitch_var = tk.DoubleVar(value=getattr(self.args, "neck_pitch", 0.0))
+        tk.Spinbox(
+            pitch_row, textvariable=self._neck_pitch_var,
+            from_=-90.0, to=90.0, increment=5.0, width=6,
+            bg=BTN_BG, fg=BTN_FG, font=("Helvetica", 9),
+            command=self._on_neck_pitch_change,
+        ).pack(side=tk.LEFT, padx=4)
+        tk.Label(pitch_row, text="(下+ → 重力方向・高さ計測に使用)",
+                 bg=PANEL_BG, fg="#666666", font=("Helvetica", 8)).pack(side=tk.LEFT)
+
+        add_btn(f3, "↓  首を動かす",    self._on_head_move, "head_move")
+        add_btn(f3, "↑  首を初期位置へ", self._on_head_home, "head_home")
+
+        # 重力方向表示
+        grav_row = tk.Frame(f3, bg=PANEL_BG)
+        grav_row.pack(fill=tk.X, pady=(4, 0))
+        tk.Label(grav_row, text="重力方向:", bg=PANEL_BG, fg="#aaaaaa",
+                 font=("Helvetica", 8)).pack(side=tk.LEFT)
+        self._lbl_gravity = tk.Label(grav_row, text="計算中...",
+                                      bg=PANEL_BG, fg="#88aaff",
+                                      font=("Courier", 8))
+        self._lbl_gravity.pack(side=tk.LEFT, padx=4)
+
+        # ── 4. 姿勢推定 ──
+        f4 = section("4. 姿勢推定")
+        tk.Label(f4, text="↑ 画像をクリックして物体選択",
                  bg=PANEL_BG, fg="#888888", font=("Helvetica", 8)).pack(anchor="w")
-        add_btn(f3, "→  計算機へ送信・姿勢推定", self._on_estimate, "estimate")
-        add_btn(f3, "→  把持姿勢生成",           self._on_grasp,    "grasp")
+        add_btn(f4, "→  計算機へ送信・姿勢推定", self._on_estimate, "estimate")
+        add_btn(f4, "→  把持姿勢生成",           self._on_grasp,    "grasp")
 
-        f4 = section("4. アーム制御")
-        add_btn(f4, "▶  両アームを移動",  self._on_move,          "move",    color="#3d5b7a")
-        add_btn(f4, "○  グリッパ 開",    self._on_gripper_open,  "g_open")
-        add_btn(f4, "●  グリッパ 閉",    self._on_gripper_close, "g_close")
-        add_btn(f4, "⌂  初期姿勢へ",     self._on_home,          "home")
+        # ── 5. アーム制御 ──
+        f5 = section("5. アーム制御")
+        add_btn(f5, "▶  両アームを移動",   self._on_move,        "move",       color="#3d5b7a")
+        add_btn(f5, "▶  左アームのみ移動", self._on_move_left,   "move_left",  color="#3a547a")
+        add_btn(f5, "▶  右アームのみ移動", self._on_move_right,  "move_right", color="#3a547a")
+        add_btn(f5, "○  グリッパ 開",     self._on_gripper_open,  "g_open")
+        add_btn(f5, "●  グリッパ 閉",     self._on_gripper_close, "g_close")
+        add_btn(f5, "⌂  初期姿勢へ",      self._on_home,          "home")
 
+        # 座標表示
         fr = section("把持座標 (base_link) [m]")
         self._lbl_lh    = tk.Label(fr, text="左手首: -", bg=PANEL_BG, fg="#aaffaa",
                                     font=("Courier", 8), anchor="w")
@@ -852,9 +832,13 @@ class SciurusGUI:
             "kill":        True,
             "cam_connect": s == S_IDLE,
             "capture":     s == S_CAMERA and not w,
+            "head_move":   can_arm,
+            "head_home":   can_arm,
             "estimate":    s == S_SELECTED and not w,
             "grasp":       s == S_GRASP_READY and not w,
             "move":        s == S_DONE and not w,
+            "move_left":   s == S_DONE and not w,
+            "move_right":  s == S_DONE and not w,
             "g_open":      can_arm,
             "g_close":     can_arm,
             "home":        can_arm,
@@ -946,6 +930,52 @@ class SciurusGUI:
         self._log(f"フレーム取得完了: shape={rgb.shape}  ─  クリックで物体を選択してください")
         self._set_state(S_CAPTURED)
 
+    # ──────────────────────── 頭部制御 ─────────────────────────────────────────
+
+    def _on_head_move(self):
+        yaw   = self._neck_yaw_var.get()
+        pitch = self._neck_pitch_var.get()
+        self._run_bg(self._do_head_move, yaw, pitch)
+
+    def _do_head_move(self, yaw_deg: float, pitch_deg: float):
+        if self.args.demo:
+            self._log(f"[Demo] 首を動かします: ヨー={yaw_deg:.1f}°, ピッチ={pitch_deg:.1f}°")
+            time.sleep(0.8)
+            self._log("[Demo] 首移動完了")
+            return
+        robot    = self._get_robot()
+        plan_p   = self._make_plan_params(robot, vel=0.3)
+        head_comp = robot.get_planning_component(self.args.head_group)
+        model    = robot.get_robot_model()
+        rs       = RobotState(model)
+        rs.set_joint_positions({
+            self.args.neck_yaw_joint:   math.radians(yaw_deg),
+            self.args.neck_pitch_joint: math.radians(pitch_deg),
+        })
+        head_comp.set_start_state_to_current_state()
+        head_comp.set_goal_state(robot_state=rs)
+        _plan_and_execute(robot, head_comp, self._log, plan_p)
+        self._log(f"[頭部] 移動完了: ヨー={yaw_deg:.1f}°, ピッチ={pitch_deg:.1f}°")
+
+    def _on_head_home(self):
+        self._run_bg(self._do_head_home)
+
+    def _do_head_home(self):
+        if self.args.demo:
+            self._log("[Demo] 首を初期位置へ戻します")
+            time.sleep(0.5)
+            self._log("[Demo] 首初期化完了")
+            return
+        robot    = self._get_robot()
+        plan_p   = self._make_plan_params(robot, vel=0.3)
+        head_comp = robot.get_planning_component(self.args.head_group)
+        head_comp.set_start_state_to_current_state()
+        head_comp.set_goal_state(configuration_name="head_init_pose")
+        _plan_and_execute(robot, head_comp, self._log, plan_p)
+        self._log("[頭部] 初期位置へ移動完了")
+
+    # ──────────────────────── 姿勢推定 ─────────────────────────────────────────
+
     def _on_estimate(self):
         if self._click_x < 0:
             self._log("[エラー] 画像をクリックして物体を選択してください")
@@ -998,21 +1028,6 @@ class SciurusGUI:
         lh_cam = normalized_to_camera(np.asarray(lh_norm), pose)
         rh_cam = normalized_to_camera(np.asarray(rh_norm), pose)
         self._finish_grasp(lh_cam, rh_cam)
-    def _do_estimate_demo(self):
-        """デモ推定: 実際の HTTP 通信なし。ダミーの R, t を生成する。"""
-        self._log("[Demo Step 1] SAM-3D メッシュ生成シミュレーション...")
-        time.sleep(1.2)
-        # 既存の test_object.ply があれば使用、なければ mesh_out を指定
-        test_mesh = os.path.join(_REPO_ROOT, "client", "meshes", "test_object.ply")
-        self._mesh_path = test_mesh if os.path.exists(test_mesh) else self.args.mesh_out
-        self._log(f"[Mock Step 1完了] mesh: {self._mesh_path}")
-
-        self._log("[Demo Step 2] SAM-6D pose 推定シミュレーション...")
-        time.sleep(1.2)
-        self._R = np.eye(3, dtype=np.float32)
-        self._t = np.array([0.35, 0.0, 0.50], dtype=np.float32)
-        self._log(f"[Mock Step 2完了] t=[{self._t[0]:.3f}, {self._t[1]:.3f}, {self._t[2]:.3f}] m (ダミー)")
-        self.root.after(0, lambda: self._set_state(S_GRASP_READY))
 
     def _on_grasp(self):
         if self._sam6d_client is not None and self._sam6d_client._server_mesh_path:
@@ -1024,7 +1039,6 @@ class SciurusGUI:
             self._run_bg(self._do_grasp_demo, on_error_state=S_GRASP_READY)
 
     def _do_grasp_server(self):
-        """server_grasp.py に把持姿勢生成を依頼する (サーバ側 GPU 使用)。"""
         self._log("[Step 3] Shape2Gesture で把持姿勢生成中 (サーバ側)...")
         result = self._sam6d_client.generate_grasp(
             gravity=self._gravity, num_samples=1
@@ -1041,17 +1055,25 @@ class SciurusGUI:
         self._finish_grasp(lh_cam, rh_cam)
 
     def _do_grasp_local(self):
-        """ローカル GraspGenerator による把持姿勢生成 (フォールバック)。"""
         self._log("[Step 3] Shape2Gesture で把持姿勢生成中 (ローカル)...")
         mesh_pts = load_pointcloud_ply(self._mesh_path, target_points=2048)
-        mesh_pts, R_corr = _align_from_gravity(mesh_pts, self._gravity)
+        # 重力方向で高さ軸を揃えてから把持姿勢を生成する
+        mesh_pts_aligned, R_corr = _align_from_gravity(mesh_pts, self._gravity)
+        # 重力方向に沿ったオブジェクト高さを計測してログに出力
+        g_dir = (self._gravity / np.linalg.norm(self._gravity)) if self._gravity is not None \
+                else np.array([0.0, -1.0, 0.0])
+        heights = mesh_pts_aligned @ (-g_dir)
+        obj_height_m = float((heights.max() - heights.min())) / 1000.0 \
+                       if mesh_pts_aligned.shape[1] == 3 else 0.0
+        self._log(f"[高さ計測] 重力方向物体高さ ≈ {obj_height_m * 1000:.1f} mm "
+                  f"(gravity={g_dir.round(3)})")
         R = (self._R.astype(np.float64) @ R_corr.T).astype(np.float32)
-        centered     = mesh_pts - mesh_pts.mean(axis=0)
+        centered     = mesh_pts_aligned - mesh_pts_aligned.mean(axis=0)
         mesh_scale_m = float(np.max(np.linalg.norm(centered, axis=1))) / 1000.0
         pose = ObjectPose(center_3d=self._t, scale=mesh_scale_m, R=R)
         generator = GraspGenerator(model_dir=self.args.model_dir, epoch=self.args.model_epoch)
         generator.load_models()
-        results    = generator.generate(mesh_pts, num_samples=1)
+        results    = generator.generate(mesh_pts_aligned, num_samples=1)
         lh_norm, rh_norm = results[0]
         lh_cam = normalized_to_camera(lh_norm, pose)
         rh_cam = normalized_to_camera(rh_norm, pose)
@@ -1079,7 +1101,6 @@ class SciurusGUI:
         self._update_coord_labels(lh_base, rh_base)
 
     def _do_grasp_demo(self):
-        """デモ把持姿勢生成: ダミーの手首座標を生成する。"""
         self._log("[Demo Step 3] Shape2Gesture シミュレーション...")
         time.sleep(1.5)
         lh_wrist = np.array([self._t[0] - 0.05, self._t[1] + 0.12, self._t[2]])
@@ -1097,6 +1118,8 @@ class SciurusGUI:
             self._set_state(S_DONE)
         self.root.after(0, _upd)
 
+    # ──────────────────────── アーム移動 ───────────────────────────────────────
+
     def _on_move(self):
         if self._lh_base is None or self._rh_base is None:
             self._log("[エラー] 把持座標が生成されていません")
@@ -1107,7 +1130,28 @@ class SciurusGUI:
             on_error_state=S_DONE,
         )
 
+    def _on_move_left(self):
+        if self._lh_base is None:
+            self._log("[エラー] 左手把持座標が生成されていません")
+            return
+        self._set_state(S_MOVING)
+        self._run_bg(
+            self._do_move_left_demo if self.args.demo else self._do_move_left,
+            on_error_state=S_DONE,
+        )
+
+    def _on_move_right(self):
+        if self._rh_base is None:
+            self._log("[エラー] 右手把持座標が生成されていません")
+            return
+        self._set_state(S_MOVING)
+        self._run_bg(
+            self._do_move_right_demo if self.args.demo else self._do_move_right,
+            on_error_state=S_DONE,
+        )
+
     def _do_move(self):
+        """両アームを把持位置へ移動する。"""
         robot = self._get_robot()
         log   = self._log
         l_arm     = robot.get_planning_component(self.args.l_arm_group)
@@ -1156,8 +1200,72 @@ class SciurusGUI:
         log("[Step 5完了] 把持動作終了")
         self.root.after(0, lambda: self._set_state(S_DONE))
 
+    def _move_single_arm(self, robot, side: str):
+        """片腕のみを把持位置へ移動する共通ヘルパー (side='left' or 'right')。"""
+        log = self._log
+        if side == "left":
+            arm_group    = self.args.l_arm_group
+            gripper_name = "l_gripper_group"
+            pose_link    = self.args.l_pose_link
+            orientation  = Quaternion(x=-0.707, y=0.0, z=0.0, w=0.707)
+            open_angle   = math.radians(-40.0)
+            grasp_angle  = math.radians(-20.0)
+            init_pose    = "l_arm_init_pose"
+            wrist_base   = self._lh_base
+        else:
+            arm_group    = self.args.r_arm_group
+            gripper_name = "r_gripper_group"
+            pose_link    = self.args.r_pose_link
+            orientation  = Quaternion(x=0.707, y=0.0, z=0.0, w=0.707)
+            open_angle   = math.radians(40.0)
+            grasp_angle  = math.radians(20.0)
+            init_pose    = "r_arm_init_pose"
+            wrist_base   = self._rh_base
+
+        plan_p   = self._make_plan_params(robot, vel=0.1)
+        g_plan_p = self._make_plan_params(robot, vel=1.0)
+        arm      = robot.get_planning_component(arm_group)
+        gripper  = robot.get_planning_component(gripper_name)
+        model    = robot.get_robot_model()
+
+        def set_gripper(angle):
+            rs = RobotState(model)
+            rs.set_joint_group_positions(gripper_name, [angle])
+            gripper.set_start_state_to_current_state()
+            gripper.set_goal_state(robot_state=rs)
+            _plan_and_execute(robot, gripper, log, g_plan_p)
+
+        log(f"[{side}アーム] 初期姿勢へ...")
+        arm.set_start_state_to_current_state()
+        arm.set_goal_state(configuration_name=init_pose)
+        _plan_and_execute(robot, arm, log, plan_p)
+
+        log(f"[{side}アーム] グリッパ開放...")
+        set_gripper(open_angle)
+
+        Z = self.args.pre_grasp_z_offset
+        pre = wrist_base.copy(); pre[2] += Z
+        log(f"[{side}アーム] プリグラスプへ移動 (z+{Z:.2f}m)...")
+        self.node.move_arm(robot, arm, plan_p, pre, pose_link, orientation)
+
+        log(f"[{side}アーム] グラスプ位置へ下降...")
+        self.node.move_arm(robot, arm, plan_p, wrist_base, pose_link, orientation)
+
+        log(f"[{side}アーム] グリッパ閉鎖...")
+        set_gripper(grasp_angle)
+        log(f"[{side}アーム完了]")
+
+    def _do_move_left(self):
+        robot = self._get_robot()
+        self._move_single_arm(robot, "left")
+        self.root.after(0, lambda: self._set_state(S_DONE))
+
+    def _do_move_right(self):
+        robot = self._get_robot()
+        self._move_single_arm(robot, "right")
+        self.root.after(0, lambda: self._set_state(S_DONE))
+
     def _do_move_demo(self):
-        """モックアーム移動: 実際には動かさず各ステップをシミュレートする。"""
         Z = self.args.pre_grasp_z_offset
         lh_pre = self._lh_base.copy(); lh_pre[2] += Z
         rh_pre = self._rh_base.copy(); rh_pre[2] += Z
@@ -1170,13 +1278,47 @@ class SciurusGUI:
             ("グリッパ閉鎖 (把持)",             0.8),
         ]
         for msg, delay in steps:
-            self._log(f"[Demo Step 5] {msg}...")
+            self._log(f"[Demo 両アーム] {msg}...")
             time.sleep(delay)
 
         self._log(f"[Demo] 左アーム目標: {self._lh_base}")
         self._log(f"[Demo] 右アーム目標: {self._rh_base}")
-        self._log("[Mock Step 5完了] 把持動作シミュレーション終了")
+        self._log("[Mock 両アーム完了]")
         self.root.after(0, lambda: self._set_state(S_DONE))
+
+    def _do_move_left_demo(self):
+        Z = self.args.pre_grasp_z_offset
+        steps = [
+            ("初期姿勢へ移動中",               1.0),
+            ("グリッパ開放",                   0.5),
+            (f"プリグラスプへ移動 (z+{Z:.2f}m)", 1.5),
+            ("グラスプ位置へ下降",              1.2),
+            ("グリッパ閉鎖 (把持)",             0.8),
+        ]
+        for msg, delay in steps:
+            self._log(f"[Demo 左アーム] {msg}...")
+            time.sleep(delay)
+        self._log(f"[Demo] 左アーム目標: {self._lh_base}")
+        self._log("[Mock 左アーム完了]")
+        self.root.after(0, lambda: self._set_state(S_DONE))
+
+    def _do_move_right_demo(self):
+        Z = self.args.pre_grasp_z_offset
+        steps = [
+            ("初期姿勢へ移動中",               1.0),
+            ("グリッパ開放",                   0.5),
+            (f"プリグラスプへ移動 (z+{Z:.2f}m)", 1.5),
+            ("グラスプ位置へ下降",              1.2),
+            ("グリッパ閉鎖 (把持)",             0.8),
+        ]
+        for msg, delay in steps:
+            self._log(f"[Demo 右アーム] {msg}...")
+            time.sleep(delay)
+        self._log(f"[Demo] 右アーム目標: {self._rh_base}")
+        self._log("[Mock 右アーム完了]")
+        self.root.after(0, lambda: self._set_state(S_DONE))
+
+    # ──────────────────────── グリッパ / 初期姿勢 ──────────────────────────────
 
     def _on_gripper_open(self):
         self._run_bg(self._do_gripper, "open")
@@ -1266,7 +1408,7 @@ def main():
     parser.add_argument("--demo-image", default=None,
                         help="デモ時に使用する画像フォルダ (rgb.png / depth.png / cam.json)")
     parser.add_argument("--neck-pitch", type=float, default=0.0,
-                        help="首ピッチ角 [deg]。正=下向き。重力方向の計算に使用 (デフォルト: 0)")
+                        help="首ピッチ角の初期値 [deg]。正=下向き。重力方向・高さ計測に使用")
 
     parser.add_argument("--server-url",  default="http://10.40.1.126:8080")
     parser.add_argument("--grasp-url",   default="",
@@ -1293,12 +1435,19 @@ def main():
     parser.add_argument("--r-pose-link",  default="r_link7")
     parser.add_argument("--pre-grasp-z-offset", type=float, default=0.10)
 
+    # 頭部制御
+    parser.add_argument("--head-group",        default="head_group",
+                        help="頭部 MoveIt planning group 名")
+    parser.add_argument("--neck-yaw-joint",    default="neck_joint_1",
+                        help="頭部ヨー関節名 (sciurus17 SRDF に合わせて設定)")
+    parser.add_argument("--neck-pitch-joint",  default="neck_joint_2",
+                        help="頭部ピッチ関節名 (sciurus17 SRDF に合わせて設定)")
+
     parser.add_argument("--launch-cmd", default="",
                         help="sciurus17 起動コマンド (例: ros2 launch ...)")
 
     args = parser.parse_args()
 
-    # モード選択
     if args.demo or not _ROS2_OK:
         if not args.demo:
             print("[情報] ROS2 が見つかりません。自動的にデモモードで起動します。")
