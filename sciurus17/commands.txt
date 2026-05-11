@@ -4,12 +4,12 @@
 
 【前提】
 - VSCode のターミナルで Ubuntu (WSL2) を選択して実行すること
-- 実機接続時は usbipd-win でデバイスをアタッチしてから sciurus17_real を使用すること
+- すべてのコマンドは sciurus17/ ディレクトリで実行すること
+  cd /mnt/c/Users/yokada/Desktop/robo_ros/sciurus17
 
 --------------------------------------------------
-【ステップ1】イメージをビルド（初回のみ）
+【ステップ1】イメージをビルド（初回のみ・数分かかる）
 --------------------------------------------------
-cd /mnt/c/Users/yokada/Desktop/robo_ros/sciurus17
 docker compose build
 
 --------------------------------------------------
@@ -24,21 +24,27 @@ colcon build --symlink-install
 exit
 
 --------------------------------------------------
-【ステップ3-A】把持 GUI を起動する
+【把持 GUI を起動する】
 --------------------------------------------------
-docker compose run --rm sciurus17 \
-    python3 /robo_ros/ros/sciurus17_gui_main.py \
-    --server-url http://10.40.1.126:8080
-
-# デモモード (ROS2 / 実機不要)
+# デモモード（実機・ROS2 トピック不要）
 docker compose run --rm sciurus17 \
     python3 /robo_ros/ros/sciurus17_gui_main.py \
     --demo \
     --demo-image /robo_ros/client/saved_data/test_20260422_200416 \
     --server-url http://10.40.1.126:8080
 
+# 実機モード（ROS2 トピック・MoveIt2 が有効な状態で実行）
+docker compose run --rm sciurus17 \
+    python3 /robo_ros/ros/sciurus17_gui_main.py \
+    --server-url http://10.40.1.126:8080
+
+# 実機 + シリアルデバイス接続時
+docker compose run --rm sciurus17_real \
+    python3 /robo_ros/ros/sciurus17_gui_main.py \
+    --server-url http://10.40.1.126:8080
+
 --------------------------------------------------
-【ステップ3-B】RViz + デモ起動（ターミナル1）
+【RViz + デモ起動（ターミナル1）】
 --------------------------------------------------
 docker compose run --rm sciurus17
 
@@ -50,7 +56,7 @@ ros2 launch sciurus17_examples demo.launch.py \
     use_chest_camera:=false
 
 --------------------------------------------------
-【ステップ3-C】アームを動かす（ターミナル2）
+【アームを動かす（ターミナル2 / 既存コンテナに追加接続）】
 --------------------------------------------------
 docker exec -it sciurus17_ros2 bash
 
