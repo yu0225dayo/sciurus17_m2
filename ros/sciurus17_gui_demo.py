@@ -946,30 +946,33 @@ class SciurusGUI:
                              timeout_mesh=300.0, timeout_pose=60.0,
                              grasp_server_url=grasp_url)
         self._sam6d_client = client
-        mesh_path = self.args.mesh_out
-        os.makedirs(os.path.dirname(os.path.abspath(mesh_path)), exist_ok=True)
-
-        self._log(f"[Step 1] SAM-3D でメッシュ生成中 (選択点: {self._click_x}, {self._click_y})...")
-        _, _, _ = client.save_reference_mesh(
-            rgb, mesh_path,
+        self._log(f"[Step 1-3] server_grasp.py で pose+grasp 一括実行中 (選択点: {self._click_x}, {self._click_y})...")
+        result = client.estimate_and_generate_grasp(
+            rgb, depth_m, intr,
             click_x=self._click_x, click_y=self._click_y,
+            gravity=self._gravity,
             mesh_method=self.args.mesh_method,
+            num_samples=1,
         )
-        self._mesh_path = mesh_path
-        self._log(f"[Step 1完了] mesh: {mesh_path}")
-
-        self._log("[Step 2] SAM-6D で 6DoF pose 推定中...")
-        R, t, _, _ = client.estimate_pose(rgb, depth_m, intr,
-                                          click_x=self._click_x, click_y=self._click_y,
-                                          gravity=self._gravity)
+        self._mesh_path = result.get("mesh_path", self.args.mesh_out)
+        R, t = result["R"], result["t"]
         self._R, self._t = R, t
-        self._log(f"[Step 2完了] t=[{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}] m")
+        self._log(f"[Step 1-3完了] mesh: {self._mesh_path}")
+        self._log(f"[Step 1-3完了] t=[{t[0]:.3f}, {t[1]:.3f}, {t[2]:.3f}] m")
         rgb_snap, intr_snap = rgb, intr
-        self.root.after(0, lambda: (
-            self._vis_win and self._vis_win.update_pose(rgb_snap, R, t, intr_snap),
-            self._set_state(S_GRASP_READY),
-        ))
+        self.root.after(0, lambda: self._vis_win and self._vis_win.update_pose(
+            rgb_snap, R, t, intr_snap))
 
+        grasp = result["grasps"][0]
+        lh_norm = grasp["left_hand"]
+        rh_norm = grasp["right_hand"]
+        mesh_scale_m = result["mesh_scale_m"]
+        R_corr = result["R_corr"].astype(np.float64)
+        R_final = (R.astype(np.float64) @ R_corr.T).astype(np.float32)
+        pose = ObjectPose(center_3d=t, scale=mesh_scale_m, R=R_final)
+        lh_cam = normalized_to_camera(lh_norm, pose)
+        rh_cam = normalized_to_camera(rh_norm, pose)
+        self._finish_grasp(lh_cam[0], rh_cam[0])
     def _do_estimate_demo(self):
         """デモ推定: 実際の HTTP 通信なし。ダミーの R, t を生成する。"""
         self._log("[Demo Step 1] SAM-3D メッシュ生成シミュレーション...")

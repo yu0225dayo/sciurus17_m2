@@ -397,3 +397,72 @@ class SAM6DClient:
             "mesh_scale_m": float(raw["mesh_scale_m"]),
             "R_corr":       np.array(raw["R_corr"], dtype=np.float32),
         }
+
+    def estimate_and_generate_grasp(
+        self,
+        rgb: np.ndarray,
+        depth: np.ndarray,
+        intrinsics: CameraIntrinsics,
+        click_x: int = -1,
+        click_y: int = -1,
+        gravity: Optional[np.ndarray] = None,
+        num_samples: int = 1,
+        seed: int = 42,
+        mesh_method: str = "knn",
+        object_size_mm: float = 0.0,
+    ) -> dict:
+        """
+        server_grasp.py の一括 API で、メッシュ生成、6DoF pose 推定、把持姿勢生成をまとめて実行する。
+        """
+        _, buf = cv2.imencode(".jpg", rgb, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        rgb_bytes = buf.tobytes()
+        depth_bytes = depth.astype(np.float32).tobytes()
+        url = (self.grasp_server_url or self.server_url) + "/estimate_and_generate_grasp"
+        data = {
+            "fx": intrinsics.fx,
+            "fy": intrinsics.fy,
+            "cx": intrinsics.cx,
+            "cy": intrinsics.cy,
+            "click_x": click_x,
+            "click_y": click_y,
+            "seed": seed,
+            "mesh_method": mesh_method,
+            "object_size_mm": object_size_mm,
+            "num_samples": num_samples,
+            **({"gravity_x": float(gravity[0]),
+                "gravity_y": float(gravity[1]),
+                "gravity_z": float(gravity[2])}
+               if gravity is not None else {}),
+        }
+
+        print(f"[SAM6D] pose+grasp 一括実行中 (grasp_server={url.split('/estimate')[0]})...")
+        resp = requests.post(
+            url,
+            files={
+                "rgb_image": ("frame.jpg", rgb_bytes, "image/jpeg"),
+                "depth_image": ("depth.bin", depth_bytes, "application/octet-stream"),
+            },
+            data=data,
+            timeout=self.timeout_mesh + self.timeout_pose + self.timeout_grasp,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"GraspServer 一括 API エラー ({resp.status_code}): {resp.text}")
+
+        raw = resp.json()
+        grasps = [
+            {
+                "left_hand": np.array(g["left_hand"], dtype=np.float32),
+                "right_hand": np.array(g["right_hand"], dtype=np.float32),
+            }
+            for g in raw["grasps"]
+        ]
+        self._server_mesh_path = raw.get("mesh_path", "")
+        self._template_dir = raw.get("template_dir", "")
+        return {
+            **raw,
+            "R": np.array(raw["R"], dtype=np.float32),
+            "t": np.array(raw["t"], dtype=np.float32),
+            "grasps": grasps,
+            "mesh_scale_m": float(raw["mesh_scale_m"]),
+            "R_corr": np.array(raw["R_corr"], dtype=np.float32),
+        }

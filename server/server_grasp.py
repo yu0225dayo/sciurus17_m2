@@ -16,12 +16,14 @@ SAM-6D サーバ (server.py) と独立して動作する。
 """
 
 import argparse
+import io
+import json
 import os
 import sys
 import threading
 
 import numpy as np
-from fastapi import FastAPI, Form, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 import uvicorn
 
@@ -33,6 +35,7 @@ _grasp_model_dir: str = ""
 _grasp_client_dir: str = ""
 _grasp_generator = None
 _grasp_generator_lock = threading.Lock()
+_pipeline_server = None
 
 # /reconstruct_mesh が返す Docker パス → ホストパスのマッピング (server.py と共有 tmp)
 _host_tmp: str   = os.path.join(_SERVER_DIR, "tmp")
@@ -86,10 +89,19 @@ def _get_grasp_generator():
     return _grasp_generator
 
 
+def _json_body(resp: JSONResponse) -> dict:
+    return json.loads(resp.body.decode("utf-8"))
+
+
 @app.get("/health")
 def health():
-    gen = _grasp_generator  # ロード済みかどうかのみ確認
+    gen = _grasp_generator
+    pipeline_loaded = (
+        _pipeline_server is not None
+        and getattr(_pipeline_server, "sam_predictor", None) is not None
+    )
     return {"status": "ok", "model_loaded": gen is not None,
+            "pipeline_loaded": pipeline_loaded,
             "model_dir": _grasp_model_dir}
 
 
@@ -178,6 +190,96 @@ async def generate_grasp(
     })
 
 
+@app.post("/estimate_and_generate_grasp")
+async def estimate_and_generate_grasp(
+    rgb_image: UploadFile = File(...),
+    depth_image: UploadFile = File(...),
+    fx: float = Form(...),
+    fy: float = Form(...),
+    cx: float = Form(...),
+    cy: float = Form(...),
+    click_x: int = Form(-1),
+    click_y: int = Form(-1),
+    seed: int = Form(42),
+    mesh_method: str = Form("knn"),
+    object_size_mm: float = Form(0.0),
+    det_score_thresh: float = Form(0.2),
+    gravity_x: float = Form(0.0),
+    gravity_y: float = Form(0.0),
+    gravity_z: float = Form(0.0),
+    num_samples: int = Form(1),
+):
+    if _pipeline_server is None:
+        raise HTTPException(
+            503,
+            "SAM/SAM-6D pipeline is not loaded. Start server_grasp.py with "
+            "--sam-checkpoint, --sam3d-config and --sam3d-repo.",
+        )
+
+    rgb_bytes = await rgb_image.read()
+    depth_bytes = await depth_image.read()
+
+    recon_resp = await _pipeline_server.reconstruct_mesh(
+        image=UploadFile(filename="frame.jpg", file=io.BytesIO(rgb_bytes)),
+        click_x=click_x,
+        click_y=click_y,
+        seed=seed,
+        mesh_method=mesh_method,
+        object_size_mm=object_size_mm,
+    )
+    recon = _json_body(recon_resp)
+    mesh_path = recon["mesh_path"]
+    template_dir = recon["template_dir"]
+
+    pose_resp = await _pipeline_server.pose_estimate(
+        rgb_image=UploadFile(filename="frame.jpg", file=io.BytesIO(rgb_bytes)),
+        depth_image=UploadFile(filename="depth.bin", file=io.BytesIO(depth_bytes)),
+        fx=fx,
+        fy=fy,
+        cx=cx,
+        cy=cy,
+        mesh_path=mesh_path,
+        template_dir=template_dir,
+        det_score_thresh=det_score_thresh,
+        click_x=click_x,
+        click_y=click_y,
+        object_size_mm=object_size_mm,
+        gravity_x=gravity_x,
+        gravity_y=gravity_y,
+        gravity_z=gravity_z,
+    )
+    pose = _json_body(pose_resp)
+    if not pose.get("success"):
+        raise HTTPException(500, f"pose estimate failed: {pose}")
+
+    grasp_resp = await generate_grasp(
+        mesh_path=mesh_path,
+        gravity_x=gravity_x,
+        gravity_y=gravity_y,
+        gravity_z=gravity_z,
+        num_samples=num_samples,
+    )
+    grasp = _json_body(grasp_resp)
+
+    return JSONResponse({
+        "success": True,
+        "mesh_path": mesh_path,
+        "template_dir": template_dir,
+        "mask_center_u": recon.get("mask_center_u"),
+        "mask_center_v": recon.get("mask_center_v"),
+        "scores": recon.get("scores", []),
+        "best_idx": recon.get("best_idx", 0),
+        "R": pose["R"],
+        "t": pose["t"],
+        "mask_area": pose.get("mask_area", 0),
+        "img_pose": pose.get("img_pose", ""),
+        "img_mesh": pose.get("img_mesh", ""),
+        "grasps": grasp["grasps"],
+        "mesh_scale_m": grasp["mesh_scale_m"],
+        "R_corr": grasp["R_corr"],
+    })
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--grasp-model-dir",
@@ -190,6 +292,15 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8082)
     parser.add_argument("--host-tmp", default=os.path.join(_SERVER_DIR, "tmp"))
     parser.add_argument("--docker-tmp", default="/workspace/tmp")
+    parser.add_argument("--sam-checkpoint", default="",
+                        help="SAM2 checkpoint. Required for /estimate_and_generate_grasp.")
+    parser.add_argument("--sam3d-config", default="",
+                        help="sam-3d-objects pipeline.yaml. Required for /estimate_and_generate_grasp.")
+    parser.add_argument("--sam3d-repo", default="",
+                        help="sam-3d-objects repo path. Required for /estimate_and_generate_grasp.")
+    parser.add_argument("--sam6d-service", default="http://localhost:8081",
+                        help="SAM-6D service URL used by the imported pipeline server.")
+    parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
     _grasp_model_dir = args.grasp_model_dir
@@ -203,9 +314,23 @@ if __name__ == "__main__":
     print(f"  grasp_model_dir: {_grasp_model_dir}")
     print(f"  grasp_client_dir:{_grasp_client_dir}")
     print(f"  host_tmp:        {_host_tmp}")
+    print(f"  pipeline:        {'enabled' if args.sam_checkpoint and args.sam3d_config and args.sam3d_repo else 'disabled'}")
     print("=" * 50)
 
-    # 起動時にモデルをロード
     _get_grasp_generator()
+
+    if args.sam_checkpoint and args.sam3d_config and args.sam3d_repo:
+        import server as pipeline_server
+
+        pipeline_server._host_tmp = _host_tmp
+        pipeline_server._docker_tmp = _docker_tmp
+        pipeline_server._sam6d_url = args.sam6d_service.rstrip("/")
+        pipeline_server.load_models(
+            sam_checkpoint=args.sam_checkpoint,
+            sam3d_config=args.sam3d_config,
+            sam3d_repo=args.sam3d_repo,
+            device=args.device,
+        )
+        _pipeline_server = pipeline_server
 
     uvicorn.run(app, host=args.host, port=args.port)
