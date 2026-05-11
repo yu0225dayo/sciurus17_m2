@@ -38,10 +38,14 @@ class SAM6DClient:
         server_url: str = "http://localhost:8080",
         timeout_mesh: float = 300.0,
         timeout_pose: float = 30.0,
+        grasp_server_url: Optional[str] = None,
+        timeout_grasp: float = 120.0,
     ):
         self.server_url = server_url.rstrip("/")
         self.timeout_mesh = timeout_mesh
         self.timeout_pose = timeout_pose
+        self.grasp_server_url = grasp_server_url.rstrip("/") if grasp_server_url else None
+        self.timeout_grasp = timeout_grasp
         self._mesh_path: Optional[str] = None      # ローカルの .ply パス
         self._server_mesh_path: str = ""            # サーバ側の .ply パス
         self._template_dir: str = ""               # サーバ側テンプレートディレクトリ
@@ -246,6 +250,7 @@ class SAM6DClient:
         intrinsics: CameraIntrinsics,
         click_x: int = -1,
         click_y: int = -1,
+        gravity: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
         """
         RGBD + reference mesh からカメラ座標系での物体 6DoF pose を推定する
@@ -290,6 +295,10 @@ class SAM6DClient:
                 "click_x":         click_x,
                 "click_y":         click_y,
                 "object_size_mm":  self._object_size_mm,
+                **( {"gravity_x": float(gravity[0]),
+                     "gravity_y": float(gravity[1]),
+                     "gravity_z": float(gravity[2])}
+                    if gravity is not None else {} ),
             },
             timeout=self.timeout_pose,
         )
@@ -322,3 +331,69 @@ class SAM6DClient:
                     img_mesh_bgr = img
 
         return R, t, img_pose_bgr, img_mesh_bgr
+
+    # ------------------------------------------------------------------
+    # 把持姿勢生成 (server_grasp.py へのリクエスト)
+    # ------------------------------------------------------------------
+
+    def generate_grasp(
+        self,
+        gravity: Optional[np.ndarray] = None,
+        num_samples: int = 1,
+    ) -> dict:
+        """
+        server_grasp.py に把持姿勢生成を依頼する
+
+        Args:
+            gravity:     カメラ座標系の重力方向ベクトル (None=固定補正)
+            num_samples: 生成する把持候補数
+
+        Returns:
+            {
+              "grasps": [{"left_hand": (23,3), "right_hand": (23,3)}, ...],
+              "mesh_scale_m": float,
+              "R_corr": (3,3) ndarray
+            }
+
+        使用例 (クライアント側での座標変換):
+            result = client.generate_grasp(gravity=gvec, num_samples=1)
+            lh_norm = result["grasps"][0]["left_hand"]   # (23,3)
+            R = R_from_sam6d @ result["R_corr"].T
+            pose = ObjectPose(center_3d=t, scale=result["mesh_scale_m"], R=R)
+            wrist_cam = normalized_to_camera(lh_norm, pose)[0]
+        """
+        if not self._server_mesh_path:
+            raise RuntimeError(
+                "サーバ側 mesh パスが未設定です。"
+                "save_reference_mesh() を先に呼んでください。"
+            )
+
+        url = (self.grasp_server_url or self.server_url) + "/generate_grasp"
+        data = {
+            "mesh_path":   self._server_mesh_path,
+            "num_samples": num_samples,
+            **( {"gravity_x": float(gravity[0]),
+                 "gravity_y": float(gravity[1]),
+                 "gravity_z": float(gravity[2])}
+                if gravity is not None else {} ),
+        }
+
+        print(f"[SAM6D] 把持姿勢生成中 (grasp_server={url.split('/generate')[0]})...")
+        resp = requests.post(url, data=data, timeout=self.timeout_grasp)
+
+        if resp.status_code != 200:
+            raise RuntimeError(f"GraspServer エラー ({resp.status_code}): {resp.text}")
+
+        raw = resp.json()
+        grasps = [
+            {
+                "left_hand":  np.array(g["left_hand"],  dtype=np.float32),
+                "right_hand": np.array(g["right_hand"], dtype=np.float32),
+            }
+            for g in raw["grasps"]
+        ]
+        return {
+            "grasps":       grasps,
+            "mesh_scale_m": float(raw["mesh_scale_m"]),
+            "R_corr":       np.array(raw["R_corr"], dtype=np.float32),
+        }
