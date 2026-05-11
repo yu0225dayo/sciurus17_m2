@@ -17,6 +17,7 @@ SAM-6D サーバ (server.py) と独立して動作する。
 
 import argparse
 import io
+import inspect
 import json
 import os
 import sys
@@ -91,6 +92,11 @@ def _get_grasp_generator():
 
 def _json_body(resp: JSONResponse) -> dict:
     return json.loads(resp.body.decode("utf-8"))
+
+
+def _accepted_kwargs(fn, kwargs: dict) -> dict:
+    params = inspect.signature(fn).parameters
+    return {k: v for k, v in kwargs.items() if k in params}
 
 
 def _ensure_sam3d_import_paths():
@@ -254,23 +260,24 @@ async def estimate_and_generate_grasp(
     mesh_path = recon["mesh_path"]
     template_dir = recon["template_dir"]
 
-    pose_resp = await _pipeline_server.pose_estimate(
-        rgb_image=UploadFile(filename="frame.jpg", file=io.BytesIO(rgb_bytes)),
-        depth_image=UploadFile(filename="depth.bin", file=io.BytesIO(depth_bytes)),
-        fx=fx,
-        fy=fy,
-        cx=cx,
-        cy=cy,
-        mesh_path=mesh_path,
-        template_dir=template_dir,
-        det_score_thresh=det_score_thresh,
-        click_x=click_x,
-        click_y=click_y,
-        object_size_mm=object_size_mm,
-        gravity_x=gravity_x,
-        gravity_y=gravity_y,
-        gravity_z=gravity_z,
-    )
+    pose_kwargs = _accepted_kwargs(_pipeline_server.pose_estimate, {
+        "rgb_image": UploadFile(filename="frame.jpg", file=io.BytesIO(rgb_bytes)),
+        "depth_image": UploadFile(filename="depth.bin", file=io.BytesIO(depth_bytes)),
+        "fx": fx,
+        "fy": fy,
+        "cx": cx,
+        "cy": cy,
+        "mesh_path": mesh_path,
+        "template_dir": template_dir,
+        "det_score_thresh": det_score_thresh,
+        "click_x": click_x,
+        "click_y": click_y,
+        "object_size_mm": object_size_mm,
+        "gravity_x": gravity_x,
+        "gravity_y": gravity_y,
+        "gravity_z": gravity_z,
+    })
+    pose_resp = await _pipeline_server.pose_estimate(**pose_kwargs)
     pose = _json_body(pose_resp)
     if not pose.get("success"):
         raise HTTPException(500, f"pose estimate failed: {pose}")
