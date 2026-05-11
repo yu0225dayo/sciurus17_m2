@@ -1,0 +1,32 @@
+services:
+  sciurus17:
+    build: .
+    image: sciurus17_ros2:jazzy
+    container_name: sciurus17_ros2
+    environment:
+      # WSLg (Windows 11 + Docker Desktop WSL2バックエンド) で自動的にGUI表示される
+      - DISPLAY=:0
+      - WAYLAND_DISPLAY=wayland-0
+      - XDG_RUNTIME_DIR=/run/user/1000
+      - ROS_DOMAIN_ID=0
+      - QT_X11_NO_MITSHM=1
+    volumes:
+      # ROS2 ワークスペース
+      - ./ws:/ros2_ws
+      # robo_ros プロジェクト全体 (ros/, client/ へのアクセス用)
+      - ..:/robo_ros
+      # WSLg のソケット (GUI表示用)
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - /mnt/wslg:/mnt/wslg
+      - /run/user/1000/wayland-0:/run/user/1000/wayland-0
+    stdin_open: true
+    tty: true
+
+  # 実機接続用 (usbipd-win でデバイスをアタッチしてから使用)
+  sciurus17_real:
+    extends:
+      service: sciurus17
+    container_name: sciurus17_ros2_real
+    devices:
+      - /dev/sciurus17spine:/dev/sciurus17spine
+    privileged: true
