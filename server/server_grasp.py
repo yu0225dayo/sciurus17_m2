@@ -93,6 +93,26 @@ def _json_body(resp: JSONResponse) -> dict:
     return json.loads(resp.body.decode("utf-8"))
 
 
+def _ensure_sam3d_import_paths():
+    if _pipeline_server is None:
+        return
+    sam3d_repo = getattr(_pipeline_server, "_sam3d_repo", "")
+    if not sam3d_repo:
+        return
+    sam3d_repo = os.path.abspath(os.path.expanduser(sam3d_repo))
+    notebook_path = os.path.join(sam3d_repo, "notebook")
+    inference_path = os.path.join(notebook_path, "inference.py")
+    if not os.path.exists(inference_path):
+        raise HTTPException(
+            500,
+            "sam-3d-objects notebook/inference.py was not found. "
+            f"Check --sam3d-repo: {sam3d_repo}",
+        )
+    for path in (sam3d_repo, notebook_path):
+        if path not in sys.path:
+            sys.path.insert(0, path)
+
+
 @app.get("/health")
 def health():
     gen = _grasp_generator
@@ -218,6 +238,7 @@ async def estimate_and_generate_grasp(
 
     rgb_bytes = await rgb_image.read()
     depth_bytes = await depth_image.read()
+    _ensure_sam3d_import_paths()
 
     recon_resp = await _pipeline_server.reconstruct_mesh(
         image=UploadFile(filename="frame.jpg", file=io.BytesIO(rgb_bytes)),
@@ -323,6 +344,14 @@ if __name__ == "__main__":
 
     if args.sam_checkpoint and args.sam3d_config and args.sam3d_repo:
         import server as pipeline_server
+
+        args.sam_checkpoint = os.path.abspath(os.path.expanduser(args.sam_checkpoint))
+        args.sam3d_config = os.path.abspath(os.path.expanduser(args.sam3d_config))
+        args.sam3d_repo = os.path.abspath(os.path.expanduser(args.sam3d_repo))
+        notebook_path = os.path.join(args.sam3d_repo, "notebook")
+        for path in (args.sam3d_repo, notebook_path):
+            if path not in sys.path:
+                sys.path.insert(0, path)
 
         pipeline_server._host_tmp = _host_tmp
         pipeline_server._docker_tmp = _docker_tmp
