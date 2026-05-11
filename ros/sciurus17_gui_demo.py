@@ -209,8 +209,8 @@ def _draw_hand_skeleton(rgb_bgr: np.ndarray, lh_cam: np.ndarray,
     lh_cam = np.asarray(lh_cam, dtype=np.float64)
     rh_cam = np.asarray(rh_cam, dtype=np.float64)
     for joints, color_bone, color_joint, label in [
-        (lh_cam, (0, 180, 60),  (0, 255, 100), "L"),
-        (rh_cam, (30, 100, 255), (80, 160, 255), "R"),
+        (lh_cam, (0,   0, 200), (0,   0, 255), "L"),  # 左手: 赤
+        (rh_cam, (180, 0,   0), (255, 0,   0), "R"),  # 右手: 青
     ]:
         if joints.ndim != 2:
             continue
