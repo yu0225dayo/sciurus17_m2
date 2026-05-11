@@ -23,10 +23,31 @@ rosdep install --from-paths src --ignore-src -r -y
 colcon build --symlink-install
 exit
 
+==================================================
+  GUI スクリプトの使い分け
+==================================================
+
+  sciurus17_gui_demo.py  ... ROS2 不要。GUI の動作確認・デバッグ用。
+                             保存済み RGBD を使ってサーバへの送信・把持推定を試せる。
+
+  sciurus17_gui_main.py  ... ROS2 + MoveIt2 必須。実機制御用。
+                             カメラ映像取得・アーム移動まで一括操作できる。
+
+==================================================
+
 --------------------------------------------------
-【把持 GUI を起動する】
+【sciurus17_gui_demo.py の起動（ROS2 不要）】
 --------------------------------------------------
-# デモモード（実機・ROS2 トピック不要）
+docker compose run --rm sciurus17 \
+    python3 /robo_ros/ros/sciurus17_gui_demo.py \
+    --demo \
+    --demo-image /robo_ros/client/saved_data/test_20260422_200416 \
+    --server-url http://10.40.1.126:8080
+
+--------------------------------------------------
+【sciurus17_gui_main.py の起動（実機モード）】
+--------------------------------------------------
+# モック（アーム動作なし・動作確認用）
 docker compose run --rm sciurus17 \
     python3 /robo_ros/ros/sciurus17_gui_main.py \
     --demo \
