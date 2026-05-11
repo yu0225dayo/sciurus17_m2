@@ -20,6 +20,7 @@ import io
 import inspect
 import json
 import os
+import subprocess
 import sys
 import threading
 
@@ -48,6 +49,22 @@ def _rel(path: str) -> str:
         return os.path.relpath(path, _SERVER_DIR)
     except ValueError:
         return path
+
+
+def _get_docker_workspace_host(container: str = "sam6d_service") -> str:
+    """sam6d Docker コンテナの /workspace に対応するホストパスを返す"""
+    try:
+        r = subprocess.run(
+            ["docker", "inspect", "--format", "{{json .Mounts}}", container],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0:
+            for m in json.loads(r.stdout.strip()):
+                if m.get("Destination") == "/workspace":
+                    return m["Source"]
+    except Exception:
+        pass
+    return ""
 
 
 def _align_from_gravity(pts: np.ndarray, gravity_cam=None):
@@ -360,7 +377,14 @@ if __name__ == "__main__":
             if path not in sys.path:
                 sys.path.insert(0, path)
 
-        pipeline_server._host_tmp = _host_tmp
+        # Docker の /workspace マウント元から正しい _host_tmp を導出
+        _ws_host = _get_docker_workspace_host()
+        if _ws_host:
+            pipeline_server._host_tmp = os.path.join(_ws_host, "tmp")
+            print(f"  [docker workspace] {_ws_host}  → _host_tmp={pipeline_server._host_tmp}")
+        else:
+            pipeline_server._host_tmp = _host_tmp
+            print(f"  [warning] Docker workspace 取得失敗。_host_tmp={_host_tmp}")
         pipeline_server._docker_tmp = _docker_tmp
         pipeline_server._sam6d_url = args.sam6d_service.rstrip("/")
         pipeline_server.load_models(

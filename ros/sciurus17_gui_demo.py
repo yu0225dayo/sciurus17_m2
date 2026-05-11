@@ -189,22 +189,42 @@ def _draw_pose_axes(rgb_bgr: np.ndarray, R: np.ndarray,
     return out
 
 
-def _draw_wrists(rgb_bgr: np.ndarray, lh_cam: np.ndarray,
-                 rh_cam: np.ndarray, intr):
-    """左右手首のカメラ座標を画像に投影して描画する。"""
+# Shape2Gesture / MANO 23関節の骨接続
+_HAND_CONNECTIONS = [
+    (0, 1),  (1, 2),  (2, 3),  (3, 4),   # 親指
+    (0, 5),  (5, 6),  (6, 7),  (7, 8),   # 人差し指
+    (0, 9),  (9, 10), (10, 11),(11, 12),  # 中指
+    (0, 13),(13, 14),(14, 15),(15, 16),   # 薬指
+    (0, 17),(17, 18),(18, 19),(19, 20),   # 小指
+    (0, 21),(0, 22),                       # 手のひら補助関節
+]
+
+
+def _draw_hand_skeleton(rgb_bgr: np.ndarray, lh_cam: np.ndarray,
+                         rh_cam: np.ndarray, intr) -> np.ndarray:
+    """左右の手の骨格 (23関節) をカメラ座標から画像に投影して描画する。"""
     out = rgb_bgr.copy()
     if intr is None:
         return out
-    for pt, label, color in [
-        (lh_cam, "L", (0,   220, 80 )),
-        (rh_cam, "R", (0,   120, 255)),
+    lh_cam = np.asarray(lh_cam, dtype=np.float64)
+    rh_cam = np.asarray(rh_cam, dtype=np.float64)
+    for joints, color_bone, color_joint, label in [
+        (lh_cam, (0, 180, 60),  (0, 255, 100), "L"),
+        (rh_cam, (30, 100, 255), (80, 160, 255), "R"),
     ]:
-        p = _project(pt, intr)
-        if p:
-            cv2.circle(out, p, 14, color, 2, cv2.LINE_AA)
-            cv2.circle(out, p,  4, color, -1)
-            cv2.putText(out, label, (p[0] + 16, p[1] + 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        if joints.ndim != 2:
+            continue
+        pts2d = [_project(joints[i], intr) for i in range(len(joints))]
+        for i, j in _HAND_CONNECTIONS:
+            if i < len(pts2d) and j < len(pts2d) and pts2d[i] and pts2d[j]:
+                cv2.line(out, pts2d[i], pts2d[j], color_bone, 2, cv2.LINE_AA)
+        for k, p in enumerate(pts2d):
+            if p:
+                r = 6 if k == 0 else 3
+                cv2.circle(out, p, r, color_joint, -1, cv2.LINE_AA)
+        if pts2d[0]:
+            cv2.putText(out, label, (pts2d[0][0] + 8, pts2d[0][1] + 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_joint, 2)
     return out
 
 
@@ -296,9 +316,13 @@ class VisualizationWindow:
 
     def update_grasp(self, bgr: np.ndarray, lh_cam: np.ndarray,
                      rh_cam: np.ndarray, intr):
-        """把持姿勢結果パネル: 手首投影 + 座標テキスト。"""
-        img = _draw_wrists(bgr, lh_cam, rh_cam, intr)
-        for i, (v, lbl) in enumerate([(lh_cam, "L"), (rh_cam, "R")]):
+        """把持姿勢結果パネル: 手の骨格 (23関節) 投影 + 手首座標テキスト。"""
+        lh_cam = np.asarray(lh_cam, dtype=np.float64)
+        rh_cam = np.asarray(rh_cam, dtype=np.float64)
+        img = _draw_hand_skeleton(bgr, lh_cam, rh_cam, intr)
+        lh_wrist = lh_cam[0] if lh_cam.ndim == 2 else lh_cam
+        rh_wrist = rh_cam[0] if rh_cam.ndim == 2 else rh_cam
+        for i, (v, lbl) in enumerate([(lh_wrist, "L"), (rh_wrist, "R")]):
             cv2.putText(img,
                         f"{lbl}[{v[0]:+.2f} {v[1]:+.2f} {v[2]:+.2f}]",
                         (6, img.shape[0] - 8 - i * 16),
@@ -970,9 +994,9 @@ class SciurusGUI:
         R_corr = result["R_corr"].astype(np.float64)
         R_final = (R.astype(np.float64) @ R_corr.T).astype(np.float32)
         pose = ObjectPose(center_3d=t, scale=mesh_scale_m, R=R_final)
-        lh_cam = normalized_to_camera(lh_norm, pose)
-        rh_cam = normalized_to_camera(rh_norm, pose)
-        self._finish_grasp(lh_cam[0], rh_cam[0])
+        lh_cam = normalized_to_camera(np.asarray(lh_norm), pose)
+        rh_cam = normalized_to_camera(np.asarray(rh_norm), pose)
+        self._finish_grasp(lh_cam, rh_cam)
     def _do_estimate_demo(self):
         """デモ推定: 実際の HTTP 通信なし。ダミーの R, t を生成する。"""
         self._log("[Demo Step 1] SAM-3D メッシュ生成シミュレーション...")
@@ -1011,10 +1035,9 @@ class SciurusGUI:
         R_corr       = result["R_corr"].astype(np.float64)
         R = (self._R.astype(np.float64) @ R_corr.T).astype(np.float32)
         pose = ObjectPose(center_3d=self._t, scale=mesh_scale_m, R=R)
-        lh_cam = normalized_to_camera(lh_norm, pose)
-        rh_cam = normalized_to_camera(rh_norm, pose)
-        lh_wrist, rh_wrist = lh_cam[0], rh_cam[0]
-        self._finish_grasp(lh_wrist, rh_wrist)
+        lh_cam = normalized_to_camera(np.asarray(lh_norm), pose)
+        rh_cam = normalized_to_camera(np.asarray(rh_norm), pose)
+        self._finish_grasp(lh_cam, rh_cam)
 
     def _do_grasp_local(self):
         """ローカル GraspGenerator による把持姿勢生成 (フォールバック)。"""
@@ -1031,11 +1054,16 @@ class SciurusGUI:
         lh_norm, rh_norm = results[0]
         lh_cam = normalized_to_camera(lh_norm, pose)
         rh_cam = normalized_to_camera(rh_norm, pose)
-        lh_wrist, rh_wrist = lh_cam[0], rh_cam[0]
-        self._finish_grasp(lh_wrist, rh_wrist)
+        self._finish_grasp(lh_cam, rh_cam)
 
-    def _finish_grasp(self, lh_wrist: np.ndarray, rh_wrist: np.ndarray):
-        """把持姿勢取得後の共通処理: TF2 変換 + 座標ラベル更新。"""
+    def _finish_grasp(self, lh_cam_all: np.ndarray, rh_cam_all: np.ndarray):
+        """把持姿勢取得後の共通処理: TF2 変換 + 座標ラベル更新。
+        lh_cam_all / rh_cam_all: (23, 3) カメラ座標系の全関節, または (3,) 手首のみ
+        """
+        lh_cam_all = np.asarray(lh_cam_all, dtype=np.float64)
+        rh_cam_all = np.asarray(rh_cam_all, dtype=np.float64)
+        lh_wrist = lh_cam_all[0] if lh_cam_all.ndim == 2 else lh_cam_all
+        rh_wrist = rh_cam_all[0] if rh_cam_all.ndim == 2 else rh_cam_all
         self._lh_cam, self._rh_cam = lh_wrist, rh_wrist
         self._log(f"  左手首(cam): {lh_wrist}")
         self._log(f"  右手首(cam): {rh_wrist}")
@@ -1044,9 +1072,9 @@ class SciurusGUI:
         rh_base = self.node.camera_to_base(rh_wrist, self.args.camera_frame, self.args.base_frame)
         self._lh_base, self._rh_base = lh_base, rh_base
         rgb_snap, intr_snap = self._captured_rgb, self._intrinsics
-        lh_s, rh_s = lh_wrist, rh_wrist
+        lh_all_s, rh_all_s = lh_cam_all, rh_cam_all
         self.root.after(0, lambda: self._vis_win and self._vis_win.update_grasp(
-            rgb_snap, lh_s, rh_s, intr_snap))
+            rgb_snap, lh_all_s, rh_all_s, intr_snap))
         self._update_coord_labels(lh_base, rh_base)
 
     def _do_grasp_demo(self):
