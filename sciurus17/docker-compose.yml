@@ -10,6 +10,8 @@ services:
       - XDG_RUNTIME_DIR=/run/user/1000
       - ROS_DOMAIN_ID=0
       - QT_X11_NO_MITSHM=1
+      - LANG=ja_JP.UTF-8
+      - PYTHONIOENCODING=utf-8
     volumes:
       # ROS2 ワークスペース
       - ./ws:/ros2_ws
