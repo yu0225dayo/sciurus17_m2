@@ -28,5 +28,7 @@ services:
       service: sciurus17
     container_name: sciurus17_ros2_real
     devices:
-      - /dev/sciurus17spine:/dev/sciurus17spine
+      # symlink は Docker で解決されないため ttyUSB0 を直接 sciurus17spine にマッピング
+      - /dev/ttyUSB0:/dev/sciurus17spine
+      - /dev/bus/usb:/dev/bus/usb
     privileged: true

@@ -47,22 +47,25 @@ docker compose run --rm sciurus17 \
 --------------------------------------------------
 【sciurus17_gui_main.py の起動（実機モード）】
 --------------------------------------------------
-# モック（アーム動作なし・動作確認用）
-docker compose run --rm sciurus17 \
-    python3 /robo_ros/ros/sciurus17_gui_main.py \
-    --demo \
-    --demo-image /robo_ros/client/saved_data/test_20260422_200416 \
-    --server-url http://10.40.1.126:8080
+# 事前準備（X11 表示許可 / 毎回必要）
+xhost +local:docker
 
-# 実機モード（ROS2 トピック・MoveIt2 が有効な状態で実行）
-docker compose run --rm sciurus17 \
+# 実機 + シリアルデバイス接続時（--launch-cmd 必須）
+# demo.launch.py = ハードウェア制御 + MoveIt (move_group) + 胸部カメラ を一括起動
+# ※ sciurus17_control.launch.py だけでは MoveIt が起動しないためアームが動かない
+cd ~/Desktop/test/robo_ros/sciurus17 && docker compose run --rm sciurus17_real \
     python3 /robo_ros/ros/sciurus17_gui_main.py \
-    --server-url http://10.40.1.126:8080
+    --server-url http://10.40.1.126:8080 \
+    --color-topic /head_camera/color/image_raw \
+    --depth-topic /head_camera/aligned_depth_to_color/image_raw \
+    --info-topic /head_camera/color/camera_info \
+    --camera-frame head_camera_color_optical_frame \
+    --launch-cmd 'bash -c "source /ros2_ws/install/setup.bash && ros2 launch sciurus17_examples demo.launch.py use_head_camera:=true use_chest_camera:=false"'
 
-# 実機 + シリアルデバイス接続時
-docker compose run --rm sciurus17_real \
-    python3 /robo_ros/ros/sciurus17_gui_main.py \
-    --server-url http://10.40.1.126:8080
+# GUI 操作手順:
+#   1. 「▶ sciurus17 起動」ボタンを押す → 15〜30 秒待つ（ヘッドカメラも自動起動）
+#   2. カメラ接続ボタンを押す（/head_camera/ トピックに接続）
+#   3. 画像クリックで物体選択 → 推定 → アーム移動
 
 --------------------------------------------------
 【RViz + デモ起動（ターミナル1）】

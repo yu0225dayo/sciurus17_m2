@@ -3,6 +3,11 @@ FROM osrf/ros:jazzy-desktop
 ARG DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y \
+    python3-pip \
+    python3-numpy \
+    python3-opencv \
+    python3-requests \
+    python3-pil \
     libpcl-dev \
     python3-colcon-common-extensions \
     python3-rosdep \
@@ -37,7 +42,9 @@ RUN apt-get update && apt-get install -y \
     ros-jazzy-xacro \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir Pillow "opencv-python-headless>=4.8" numpy requests plyfile
+RUN python3 -m pip install --break-system-packages --no-cache-dir plyfile
+RUN python3 -m pip install --break-system-packages --no-cache-dir \
+    torch --index-url https://download.pytorch.org/whl/cpu
 
 WORKDIR /ros2_ws
 
