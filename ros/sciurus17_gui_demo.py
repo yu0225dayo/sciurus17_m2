@@ -80,7 +80,6 @@ except ImportError:
 
 # ── client/ モジュール (省略可能) ─────────────────────────────────────────────
 _SERVER_OK = False   # サーバ通信 (SAM6DClient + coord_transform) — requests/numpy のみ
-_GRASP_OK  = False   # 把持生成 (GraspGenerator) — torch 必須
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "client"))
@@ -88,30 +87,22 @@ sys.path.insert(0, os.path.join(_REPO_ROOT, "client"))
 try:
     from pipeline.sam6d_detector import SAM6DClient
     from utils.coord_transform import CameraIntrinsics, ObjectPose, normalized_to_camera
-    from utils.pointcloud_utils import load_pointcloud_ply
     _SERVER_OK = True
 except ImportError as e:
     print(f"[情報] サーバ通信モジュール未読み込み: {e}")
-
-try:
-    from pipeline.grasp_generator import GraspGenerator
-    _GRASP_OK = True
-except ImportError as e:
-    print(f"[情報] 把持生成モジュール未読み込み (torch なし?): {e}")
 
 # ── 定数 ──────────────────────────────────────────────────────────────────────
 CANVAS_W = 640
 CANVAS_H = 480
 LIVE_MS  = 50
 
-S_IDLE        = "idle"
-S_CAMERA      = "camera"
-S_CAPTURED    = "captured"
-S_SELECTED    = "selected"
-S_ESTIMATING  = "estimating"
-S_GRASP_READY = "grasp_ready"
-S_MOVING      = "moving"
-S_DONE        = "done"
+S_IDLE       = "idle"
+S_CAMERA     = "camera"
+S_CAPTURED   = "captured"
+S_SELECTED   = "selected"
+S_ESTIMATING = "estimating"
+S_MOVING     = "moving"
+S_DONE       = "done"
 
 BG       = "#2b2b2b"
 PANEL_BG = "#3c3f41"
@@ -131,30 +122,6 @@ def _gravity_from_neck_pitch(neck_pitch_deg: float) -> np.ndarray:
     theta = math.radians(neck_pitch_deg)
     return np.array([0.0, -math.cos(theta), -math.sin(theta)], dtype=np.float32)
 
-
-def _align_from_gravity(pts: np.ndarray,
-                        gravity_cam: np.ndarray | None = None):
-    """
-    重力方向ベクトルを使って点群を Y-down に揃える回転を返す。
-    gravity_cam が None の場合は固定補正 diag([1,-1,-1]) を使用。
-    """
-    if gravity_cam is None:
-        R = np.diag([1.0, -1.0, -1.0])
-    else:
-        g = gravity_cam / np.linalg.norm(gravity_cam)
-        target = np.array([0.0, -1.0, 0.0])
-        v = np.cross(g, target)
-        s = float(np.linalg.norm(v))
-        c = float(np.dot(g, target))
-        if s < 1e-9:
-            R = np.eye(3) if c > 0 else np.diag([1.0, -1.0, -1.0])
-        else:
-            vx = np.array([[0, -v[2], v[1]],
-                           [v[2], 0, -v[0]],
-                           [-v[1], v[0], 0]], dtype=np.float64)
-            R = np.eye(3) + vx + vx @ vx * (1.0 - c) / (s ** 2)
-    R = np.asarray(R, dtype=np.float64)
-    return (R @ pts.T).T.astype(pts.dtype), R
 
 
 def _project(xyz, intr):
@@ -709,7 +676,6 @@ class SciurusGUI:
         tk.Label(f3, text="↑ 画像をクリックして物体選択",
                  bg=PANEL_BG, fg="#888888", font=("Helvetica", 8)).pack(anchor="w")
         add_btn(f3, "→  計算機へ送信・姿勢推定", self._on_estimate, "estimate")
-        add_btn(f3, "→  把持姿勢生成",           self._on_grasp,    "grasp")
 
         f4 = section("4. アーム制御")
         add_btn(f4, "▶  両アームを移動",  self._on_move,          "move",    color="#3d5b7a")
@@ -853,7 +819,6 @@ class SciurusGUI:
             "cam_connect": s == S_IDLE,
             "capture":     s == S_CAMERA and not w,
             "estimate":    s == S_SELECTED and not w,
-            "grasp":       s == S_GRASP_READY and not w,
             "move":        s == S_DONE and not w,
             "g_open":      can_arm,
             "g_close":     can_arm,
@@ -867,8 +832,7 @@ class SciurusGUI:
             S_CAMERA:      ("● カメラ接続中",                          "#88cc88"),
             S_CAPTURED:    ("● フレーム取得済 ─ 画像をクリックして選択", "#88aaff"),
             S_SELECTED:    ("● 物体選択済 ─ 計算機へ送信してください",    "#ffcc44"),
-            S_ESTIMATING:  ("⏳ 推定中...",                             "#ffaa44"),
-            S_GRASP_READY: ("● 姿勢推定済 ─ 把持姿勢生成してください",   "#aaffcc"),
+            S_ESTIMATING:  ("⏳ 推定・把持姿勢生成中...",                "#ffaa44"),
             S_MOVING:      ("⏳ アーム移動中...",                       "#ff8844"),
             S_DONE:        ("✓ 完了 ─ アームを移動できます",             "#88ff88"),
         }
@@ -999,63 +963,20 @@ class SciurusGUI:
         rh_cam = normalized_to_camera(np.asarray(rh_norm), pose)
         self._finish_grasp(lh_cam, rh_cam)
     def _do_estimate_demo(self):
-        """デモ推定: 実際の HTTP 通信なし。ダミーの R, t を生成する。"""
-        self._log("[Demo Step 1] SAM-3D メッシュ生成シミュレーション...")
+        """デモ推定: 実際の HTTP 通信なし。ダミーの R, t と把持座標を生成する。"""
+        self._log("[Demo Step 1-2] SAM-3D / SAM-6D シミュレーション...")
         time.sleep(1.2)
-        # 既存の test_object.ply があれば使用、なければ mesh_out を指定
         test_mesh = os.path.join(_REPO_ROOT, "client", "meshes", "test_object.ply")
         self._mesh_path = test_mesh if os.path.exists(test_mesh) else self.args.mesh_out
-        self._log(f"[Mock Step 1完了] mesh: {self._mesh_path}")
-
-        self._log("[Demo Step 2] SAM-6D pose 推定シミュレーション...")
-        time.sleep(1.2)
         self._R = np.eye(3, dtype=np.float32)
         self._t = np.array([0.35, 0.0, 0.50], dtype=np.float32)
-        self._log(f"[Mock Step 2完了] t=[{self._t[0]:.3f}, {self._t[1]:.3f}, {self._t[2]:.3f}] m (ダミー)")
-        self.root.after(0, lambda: self._set_state(S_GRASP_READY))
+        self._log(f"[Mock完了] t=[{self._t[0]:.3f}, {self._t[1]:.3f}, {self._t[2]:.3f}] m (ダミー)")
 
-    def _on_grasp(self):
-        if self._sam6d_client is not None and self._sam6d_client._server_mesh_path:
-            self._run_bg(self._do_grasp_server, on_error_state=S_GRASP_READY)
-        elif _GRASP_OK:
-            self._run_bg(self._do_grasp_local, on_error_state=S_GRASP_READY)
-        else:
-            self._log("[情報] サーバ未接続 / torch なし — デモ把持姿勢を使用します")
-            self._run_bg(self._do_grasp_demo, on_error_state=S_GRASP_READY)
-
-    def _do_grasp_server(self):
-        """server_grasp.py に把持姿勢生成を依頼する (サーバ側 GPU 使用)。"""
-        self._log("[Step 3] Shape2Gesture で把持姿勢生成中 (サーバ側)...")
-        result = self._sam6d_client.generate_grasp(
-            gravity=self._gravity, num_samples=1
-        )
-        grasp = result["grasps"][0]
-        lh_norm      = grasp["left_hand"]
-        rh_norm      = grasp["right_hand"]
-        mesh_scale_m = result["mesh_scale_m"]
-        R_corr       = result["R_corr"].astype(np.float64)
-        R = (self._R.astype(np.float64) @ R_corr.T).astype(np.float32)
-        pose = ObjectPose(center_3d=self._t, scale=mesh_scale_m, R=R)
-        lh_cam = normalized_to_camera(np.asarray(lh_norm), pose)
-        rh_cam = normalized_to_camera(np.asarray(rh_norm), pose)
-        self._finish_grasp(lh_cam, rh_cam)
-
-    def _do_grasp_local(self):
-        """ローカル GraspGenerator による把持姿勢生成 (フォールバック)。"""
-        self._log("[Step 3] Shape2Gesture で把持姿勢生成中 (ローカル)...")
-        mesh_pts = load_pointcloud_ply(self._mesh_path, target_points=2048)
-        mesh_pts, R_corr = _align_from_gravity(mesh_pts, self._gravity)
-        R = (self._R.astype(np.float64) @ R_corr.T).astype(np.float32)
-        centered     = mesh_pts - mesh_pts.mean(axis=0)
-        mesh_scale_m = float(np.max(np.linalg.norm(centered, axis=1))) / 1000.0
-        pose = ObjectPose(center_3d=self._t, scale=mesh_scale_m, R=R)
-        generator = GraspGenerator(model_dir=self.args.model_dir, epoch=self.args.model_epoch)
-        generator.load_models()
-        results    = generator.generate(mesh_pts, num_samples=1)
-        lh_norm, rh_norm = results[0]
-        lh_cam = normalized_to_camera(lh_norm, pose)
-        rh_cam = normalized_to_camera(rh_norm, pose)
-        self._finish_grasp(lh_cam, rh_cam)
+        self._log("[Demo Step 3] Shape2Gesture シミュレーション...")
+        time.sleep(1.0)
+        lh_wrist = np.array([self._t[0] - 0.05, self._t[1] + 0.12, self._t[2]])
+        rh_wrist = np.array([self._t[0] - 0.05, self._t[1] - 0.12, self._t[2]])
+        self._finish_grasp(lh_wrist, rh_wrist)
 
     def _finish_grasp(self, lh_cam_all: np.ndarray, rh_cam_all: np.ndarray):
         """把持姿勢取得後の共通処理: TF2 変換 + 座標ラベル更新。
@@ -1078,13 +999,6 @@ class SciurusGUI:
             rgb_snap, lh_all_s, rh_all_s, intr_snap))
         self._update_coord_labels(lh_base, rh_base)
 
-    def _do_grasp_demo(self):
-        """デモ把持姿勢生成: ダミーの手首座標を生成する。"""
-        self._log("[Demo Step 3] Shape2Gesture シミュレーション...")
-        time.sleep(1.5)
-        lh_wrist = np.array([self._t[0] - 0.05, self._t[1] + 0.12, self._t[2]])
-        rh_wrist = np.array([self._t[0] - 0.05, self._t[1] - 0.12, self._t[2]])
-        self._finish_grasp(lh_wrist, rh_wrist)
 
     def _update_coord_labels(self, lh_base, rh_base):
         self._log(f"  左手首(base): [{lh_base[0]:.3f}, {lh_base[1]:.3f}, {lh_base[2]:.3f}]")
