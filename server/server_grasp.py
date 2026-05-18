@@ -60,8 +60,12 @@ def _get_docker_workspace_host(container: str = "sam6d_service") -> str:
         )
         if r.returncode == 0:
             for m in json.loads(r.stdout.strip()):
-                if m.get("Destination") == "/workspace":
-                    return m["Source"]
+                dst = m.get("Destination", "")
+                src = m.get("Source", "")
+                if dst == "/workspace":
+                    return src
+                if dst == "/workspace/tmp" and src.endswith("/tmp"):
+                    return src[:-4]  # /workspace/tmp → strip /tmp → host workspace root
     except Exception:
         pass
     return ""
@@ -212,9 +216,10 @@ async def generate_grasp(
     gravity_cam = gvec if float(np.linalg.norm(gvec)) > 1e-6 else None
     mesh_pts_aligned, R_corr = _align_from_gravity(mesh_pts, gravity_cam)
 
-    # メッシュスケール: mm 単位の点群 → 最大半径 [m]
-    centered = mesh_pts_aligned - mesh_pts_aligned.mean(axis=0)
-    mesh_scale_m = float(np.max(np.linalg.norm(centered, axis=1))) / 1000.0
+    # メッシュスケール: mm 単位の点群 → 高さ (Y軸方向の全幅) [m]
+    # _align_from_gravity により gravity → -Y に揃っているので Y軸 = 鉛直方向
+    height_mm = float(mesh_pts_aligned[:, 1].max() - mesh_pts_aligned[:, 1].min())
+    mesh_scale_m = height_mm / 1000.0
 
     # 把持姿勢生成
     print(f"[GraspServer] 生成中 (num_samples={num_samples}, scale={mesh_scale_m:.4f} m)...")

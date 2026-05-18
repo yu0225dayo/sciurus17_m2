@@ -16,59 +16,80 @@
   # ヘルスチェック
   curl http://localhost:8081/health
 
-【ステップ3】 把持統合サーバ (server_grasp.py) を起動  ★現在の推奨
+【ステップ3】 メインサーバ (SAM-3D) を起動
   conda activate sam3d-objects
-  cd /ws/okada/SAM3D_6DoF/server
-  python server_grasp.py \
-    --grasp-model-dir ../client/save_model \
-    --grasp-client-dir ../client \
-    --sam-checkpoint  /ws/okada/project/sam2_checkpoints/sam2.1_hiera_large.pt \
-    --sam3d-config    /ws/okada/SAM3D_6DoF/server/sam-3d-objects/checkpoints/hf/pipeline.yaml \
-    --sam3d-repo      /ws/okada/SAM3D_6DoF/server/sam-3d-objects \
-    --sam6d-service   http://localhost:8081 \
-    --host 0.0.0.0 --port 8082
-
-  # ヘルスチェック
-  curl http://localhost:8082/health
-
-  ※ server_grasp.py は SAM-3D + SAM-6D + Shape2Gesture を一括提供する。
-     メッシュ生成・姿勢推定・把持姿勢生成をこのサーバ1本で処理する (port 8082)。
-     server.py (port 8080) は不要。
-
----------- (参考) server.py 単体起動 ----------
-【ステップ3 旧】 メインサーバ (server.py) を起動
-  conda activate sam3d-objects
-  python /ws/okada/SAM3D_6DoF/server/server.py \
-    --sam-checkpoint /ws/okada/project/sam2_checkpoints/sam2.1_hiera_large.pt \
-    --sam3d-config   /ws/okada/SAM3D_6DoF/server/sam-3d-objects/checkpoints/hf/pipeline.yaml \
-    --sam3d-repo     /ws/okada/SAM3D_6DoF/server/sam-3d-objects \
+  python /home/okada/ws/project/server/server.py \
+    --sam-checkpoint /home/okada/ws/project/sam2_checkpoints/sam2.1_hiera_large.pt \
+    --sam3d-config   /home/okada/ws/project/server/sam-3d-objects/checkpoints/hf/pipeline.yaml \
+    --sam3d-repo     /home/okada/ws/project/server/sam-3d-objects \
     --sam6d-service  http://localhost:8081 \
     --host 0.0.0.0 --port 8080
-------------------------------------------------
 
 ==============================
- クライアント側 (sciurus17 PC) の起動
+ ローカルPC からの実行
 ==============================
 
-【Docker で GUI を起動】
-  cd /mnt/c/Users/yokada/Desktop/robo_ros/sciurus17
+【ファイル指定】
+  python client.py \
+    --server http://<計算機IP>:8080 \
+    --rgb   rgb.png \
+    --depth depth_mm.png \
+    --fx 615.0 --fy 615.0 --cx 320.0 --cy 240.0 \
+    --save result.png --show
 
-  # デモモード (実機不要)
-  docker compose run --rm sciurus17 \
-      python3 /robo_ros/ros/sciurus17_gui_demo.py \
-      --demo \
-      --demo-image /robo_ros/client/saved_data/test_20260422_200416 \
-      --server-url http://10.40.1.126:8080
-
-  # 実機モード
-  docker compose run --rm sciurus17 \
-      python3 /robo_ros/ros/sciurus17_gui_main.py \
-      --server-url http://10.40.1.126:8082
+【RealSense カメラ】
+  python client.py \
+    --server http://<計算機IP>:8080 \
+    --realsense \
+    --save result.png --show
 
 ==============================
- API エンドポイント一覧 (server_grasp.py / port 8082)
+ API エンドポイント一覧
 ==============================
 
-  GET  /health                      → サーバ死活確認・モデルロード状態
-  POST /generate_grasp              → PLY メッシュから把持姿勢生成のみ
-  POST /estimate_and_generate_grasp → メッシュ生成 + 姿勢推定 + 把持生成 (フルパイプライン) ★推奨
+  GET  /health              → サーバ死活確認
+  GET  /sam6d/health        → SAM-6D Docker サービス死活確認
+  POST /reconstruct         → SAM-3D のみ (旧エンドポイント)
+  POST /render_templates    → SAM-6D テンプレートレンダリング
+  POST /estimate_pose       → SAM-6D 姿勢推定
+  POST /full_pipeline       → SAM-3D + SAM-6D フルパイプライン ★推奨
+  POST /segment_only        → SAM マスクのみ (デバッグ用)
+
+
+
+
+
+
+
+両方まとめて起動する場合
+ターミナル1 (SAM-6D を先に起動):
+
+
+cd ~/ws && docker compose up -d sam6d
+docker logs -f sam6d_service   # "models_loaded" が出るまで待つ
+ターミナル2 (SAM-3D を起動):
+
+
+conda activate sam3d-objects
+python /home/okada/ws/project/server/server.py \
+  --sam-checkpoint /home/okada/ws/project/sam2_checkpoints/sam2.1_hiera_large.pt \
+  --sam3d-config   /home/okada/ws/project/server/sam-3d-objects/checkpoints/hf/pipeline.yaml \
+  --sam3d-repo     /home/okada/ws/project/server/sam-3d-objects \
+  --sam6d-service  http://localhost:8081 \
+  --host 0.0.0.0 --port 8080
+
+
+python test_demo.py --mode offline-mesh --rgb test_data/rgb.png
+python test_demo.py --mode online --rgb test_data/rgb.png --depth test_data/depth.png --mesh meshes/test_object.ply --server-mesh-path "/home/okada/ws/project/tmp/server_reconstructions/object_seed42_mesh.ply" --template-dir "/workspace/tmp/server_reconstructions/object_seed42_mesh_templates"
+ブランチは既に作成済みでした。現在 feature/mesh-projection-fix ブランチにいます。main に戻るときは git checkout main でいつでも戻れます。
+
+python test_demo.py --mode online \
+  --rgb test_data/rgb.png \
+  --depth test_data/depth.png \
+  --depth-scale 0.001 \
+  --mesh meshes/test_object.ply \
+  --fx 572.4114 --fy 573.57043 --cx 325.2611 --cy 242.04899 \
+  --server-mesh-path "/home/okada/ws/project/tmp/server_reconstructions/object_seed42_mesh.ply" \
+  --template-dir "/home/okada/ws/project/tmp/server_reconstructions/object_seed42_mesh_templates" \
+  --click-x 430 --click-y 180 \
+  --no-show --skip-grasp
