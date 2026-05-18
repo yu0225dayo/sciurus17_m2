@@ -31,3 +31,9 @@ client/data/
 client/output/
 client/save_model/
 client/test_data/
+
+# ROS2 ワークスペース（ビルド成果物・submodule）
+sciurus17/ws/
+
+# Claude Code メモリ
+.claude/
