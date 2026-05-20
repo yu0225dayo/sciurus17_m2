@@ -96,8 +96,8 @@ except ImportError as e:
     print(f"[情報] サーバ通信モジュール未読み込み: {e}")
 
 # ── 定数 ──────────────────────────────────────────────────────────────────────
-CANVAS_W    = 960
-CANVAS_H    = 720
+CANVAS_W    = 800
+CANVAS_H    = 600
 LIVE_MS     = 50
 CAM_PUB_HZ  = 10.0   # 仮想カメラの配信レート
 
@@ -697,7 +697,7 @@ class SciurusRvizGUI:
         root = self.root
         root.title("sciurus17 Grasp Control Panel [RViz]")
         root.configure(bg=BG)
-        root.resizable(False, False)
+        root.resizable(True, True)
 
         # ── ヘルパ ───────────────────────────────────────────────────────────────
         def add_btn(parent, label, cmd, key, *, color=BTN_BG):

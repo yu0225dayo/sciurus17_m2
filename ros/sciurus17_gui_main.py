@@ -56,6 +56,7 @@ try:
     from cv_bridge import CvBridge
     from geometry_msgs.msg import Point, Pose, PointStamped, PoseStamped, Quaternion
     from rclpy.node import Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
     from sensor_msgs.msg import CameraInfo
     from sensor_msgs.msg import Image as RosImage
     _ROS2_OK = True
@@ -70,10 +71,12 @@ except ImportError:
     pass
 
 try:
-    from moveit.core.robot_state import RobotState
-    from moveit.planning import MoveItPy, PlanRequestParameters
-    _MOVEIT_OK = True
-except ImportError:
+    import importlib.util
+    _MOVEIT_OK = (
+        importlib.util.find_spec("moveit") is not None and
+        importlib.util.find_spec("moveit.planning") is not None
+    )
+except Exception:
     pass
 
 # ── client/ モジュール (省略可能) ─────────────────────────────────────────────
@@ -98,8 +101,8 @@ except ImportError as e:
     print(f"[情報] 把持生成モジュール未読み込み (torch なし?): {e}")
 
 # ── 定数 ──────────────────────────────────────────────────────────────────────
-CANVAS_W = 640
-CANVAS_H = 480
+CANVAS_W = 800
+CANVAS_H = 600
 LIVE_MS  = 50
 
 S_IDLE        = "idle"
@@ -320,6 +323,45 @@ class VisualizationWindow:
         self._show("grasp", img)
 
 
+class LogWindow:
+    """ログ専用ウィンドウ。閉じても withdraw するだけで再表示できる。"""
+
+    def __init__(self, parent: tk.Tk):
+        self.win = tk.Toplevel(parent)
+        self.win.title("sciurus17 Log")
+        self.win.configure(bg=BG)
+        self.win.protocol("WM_DELETE_WINDOW", self.win.withdraw)
+
+        btn_frame = tk.Frame(self.win, bg=BG)
+        btn_frame.pack(fill=tk.X, padx=4, pady=(4, 0))
+        tk.Button(btn_frame, text="クリア", command=self._clear,
+                  bg=BTN_BG, fg=BTN_FG, relief=tk.FLAT,
+                  font=("Helvetica", 9), padx=6).pack(side=tk.RIGHT)
+
+        from tkinter import scrolledtext as _st
+        self._area = _st.ScrolledText(
+            self.win, width=100, height=30,
+            bg=LOG_BG, fg=LOG_FG, font=("Courier", 9),
+            state=tk.DISABLED, wrap=tk.WORD,
+        )
+        self._area.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+    def append(self, msg: str):
+        self._area.configure(state=tk.NORMAL)
+        self._area.insert(tk.END, msg)
+        self._area.see(tk.END)
+        self._area.configure(state=tk.DISABLED)
+
+    def _clear(self):
+        self._area.configure(state=tk.NORMAL)
+        self._area.delete("1.0", tk.END)
+        self._area.configure(state=tk.DISABLED)
+
+    def show(self):
+        self.win.deiconify()
+        self.win.lift()
+
+
 def _plan_and_execute(robot, comp, log_fn, params) -> bool:
     result = comp.plan(single_plan_parameters=params)
     if result:
@@ -347,9 +389,15 @@ if _ROS2_OK:
                 self._tf_buffer   = Buffer()
                 self._tf_listener = TransformListener(self._tf_buffer, self)
 
-            self.create_subscription(RosImage,   color_topic, self._color_cb, 1)
-            self.create_subscription(RosImage,   depth_topic, self._depth_cb, 1)
-            self.create_subscription(CameraInfo, info_topic,  self._info_cb,  1)
+            _cam_qos = QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.VOLATILE,
+                history=HistoryPolicy.KEEP_LAST,
+            )
+            self.create_subscription(RosImage,   color_topic, self._color_cb, _cam_qos)
+            self.create_subscription(RosImage,   depth_topic, self._depth_cb, _cam_qos)
+            self.create_subscription(CameraInfo, info_topic,  self._info_cb,  _cam_qos)
 
         def _color_cb(self, msg):
             try:
@@ -552,19 +600,22 @@ class SciurusGUI:
         self._rh_base: np.ndarray | None = None
         self._robot                      = None
         self._process: subprocess.Popen | None = None
+        self._camera_process: subprocess.Popen | None = None
         self._vis_win: VisualizationWindow | None = None
 
-        self._log_q: queue.Queue     = queue.Queue()
+        self._log_q: queue.Queue        = queue.Queue()
         self._btns: dict[str, tk.Button] = {}
+        self._log_win: LogWindow | None  = None
 
         self._build_ui()
+        self._on_neck_pitch_change()
+        self._open_log_win()
 
         if args.demo:
             self._log(f"[モード] デモモード — カメラ:保存画像 / 推定:実サーバ {args.server_url}")
         else:
             self._log("[モード] メインモード — sciurus17 実機")
-        # 首ピッチ角から常に重力方向を計算してセット
-        self._on_neck_pitch_change()
+        self._log("  [sciurus17 起動] ボタンで ROS ノードを起動してください。")
 
         self._refresh_ui()
         self._open_vis_win()
@@ -573,6 +624,12 @@ class SciurusGUI:
 
     def _open_vis_win(self):
         self._vis_win = VisualizationWindow(self.root)
+
+    def _open_log_win(self):
+        if self._log_win is None:
+            self._log_win = LogWindow(self.root)
+        else:
+            self._log_win.show()
 
     def _on_neck_pitch_change(self, *_):
         """首ピッチ角から重力方向を計算して self._gravity にセットし、ラベルを更新する。"""
@@ -593,149 +650,119 @@ class SciurusGUI:
             title_text  = "sciurus17 把持コントロールパネル  【デモモード】"
             root.title("sciurus17 把持コントロールパネル  [DEMO]")
         else:
-            title_color = "white"
+            title_color = "#44ccff"
             title_text  = "sciurus17 把持コントロールパネル  【メインモード】"
             root.title("sciurus17 把持コントロールパネル  [MAIN]")
         root.configure(bg=BG)
-        root.resizable(False, False)
+        root.resizable(True, True)
 
-        tk.Label(root, text=title_text,
-                 font=("Helvetica", 13, "bold"), bg=BG, fg=title_color,
-                 ).grid(row=0, column=0, columnspan=2, pady=(8, 2), padx=10, sticky="ew")
-
-        # ── 左: ボタンパネル ──
-        left = tk.Frame(root, bg=BG, width=280)
-        left.grid(row=1, column=0, sticky="ns", padx=(8, 4), pady=4)
-        left.grid_propagate(False)
-
-        def section(title):
-            f = tk.LabelFrame(left, text=title, bg=PANEL_BG, fg="#bbbbbb",
-                              font=("Helvetica", 9, "bold"),
-                              padx=6, pady=4, relief=tk.GROOVE)
-            f.pack(fill=tk.X, pady=3)
-            return f
-
+        # ── ヘルパ ──
         def add_btn(parent, label, cmd, key, *, color=BTN_BG):
             b = tk.Button(parent, text=label, command=cmd,
                           bg=color, fg=BTN_FG,
                           activebackground="#6e6e6e", activeforeground="white",
                           relief=tk.FLAT, font=("Helvetica", 10),
-                          padx=4, pady=4, width=24, anchor="w")
+                          padx=4, pady=4, anchor="w")
             b.pack(fill=tk.X, pady=2)
             self._btns[key] = b
             return b
 
-        # ── 1. 起動 ──
-        f1 = section("1. 起動")
-        add_btn(f1, "▶  sciurus17 起動", self._on_launch, "launch", color="#3d6b3d")
-        add_btn(f1, "■  sciurus17 停止", self._on_kill,   "kill",   color="#6b3d3d")
+        def section(title):
+            f = tk.LabelFrame(bottom, text=title, bg=PANEL_BG, fg="#bbbbbb",
+                              font=("Helvetica", 9, "bold"),
+                              padx=6, pady=4, relief=tk.GROOVE)
+            f.pack(side=tk.LEFT, fill=tk.Y, padx=3, pady=3, anchor="n")
+            return f
 
-        # ── 2. カメラ ──
-        f2 = section("2. カメラ")
-        add_btn(f2, "▶  カメラ接続",    self._on_connect_camera, "cam_connect")
-        add_btn(f2, "フレーム取得",      self._on_capture,        "capture")
+        def spinrow(parent, label, var, from_, to_, incr=5.0, fmt=None, cmd=None):
+            row = tk.Frame(parent, bg=PANEL_BG)
+            row.pack(fill=tk.X, pady=2)
+            tk.Label(row, text=label, bg=PANEL_BG, fg="#aaaaaa",
+                     font=("Helvetica", 8)).pack(anchor="w")
+            kw = {"command": cmd} if cmd else {}
+            if fmt:
+                kw["format"] = fmt
+            tk.Spinbox(row, textvariable=var, from_=from_, to=to_, increment=incr,
+                       width=7, bg=BTN_BG, fg=BTN_FG, font=("Helvetica", 9),
+                       **kw).pack(anchor="w", padx=2)
 
-        # ── 3. 頭部制御 ──
-        f3 = section("3. 頭部制御")
+        # ── タイトル ──
+        tk.Label(root, text=title_text,
+                 font=("Helvetica", 13, "bold"), bg=BG, fg=title_color,
+                 ).pack(fill=tk.X, pady=(8, 2), padx=10)
 
-        # ヨー行
-        yaw_row = tk.Frame(f3, bg=PANEL_BG)
-        yaw_row.pack(fill=tk.X, pady=2)
-        tk.Label(yaw_row, text="ヨー[deg]:", bg=PANEL_BG, fg="#aaaaaa",
-                 font=("Helvetica", 8)).pack(side=tk.LEFT)
-        self._neck_yaw_var = tk.DoubleVar(value=0.0)
-        tk.Spinbox(
-            yaw_row, textvariable=self._neck_yaw_var,
-            from_=-90.0, to=90.0, increment=5.0, width=6,
-            bg=BTN_BG, fg=BTN_FG, font=("Helvetica", 9),
-        ).pack(side=tk.LEFT, padx=4)
-        tk.Label(yaw_row, text="(左+)", bg=PANEL_BG, fg="#666666",
-                 font=("Helvetica", 8)).pack(side=tk.LEFT)
-
-        # ピッチ行 (重力計算・高さ計測に連動)
-        pitch_row = tk.Frame(f3, bg=PANEL_BG)
-        pitch_row.pack(fill=tk.X, pady=2)
-        tk.Label(pitch_row, text="ピッチ[deg]:", bg=PANEL_BG, fg="#aaaaaa",
-                 font=("Helvetica", 8)).pack(side=tk.LEFT)
-        self._neck_pitch_var = tk.DoubleVar(value=getattr(self.args, "neck_pitch", 0.0))
-        tk.Spinbox(
-            pitch_row, textvariable=self._neck_pitch_var,
-            from_=-90.0, to=90.0, increment=5.0, width=6,
-            bg=BTN_BG, fg=BTN_FG, font=("Helvetica", 9),
-            command=self._on_neck_pitch_change,
-        ).pack(side=tk.LEFT, padx=4)
-        tk.Label(pitch_row, text="(下+ → 重力方向・高さ計測に使用)",
-                 bg=PANEL_BG, fg="#666666", font=("Helvetica", 8)).pack(side=tk.LEFT)
-
-        add_btn(f3, "↓  首を動かす",    self._on_head_move, "head_move")
-        add_btn(f3, "↑  首を初期位置へ", self._on_head_home, "head_home")
-
-        # 重力方向表示
-        grav_row = tk.Frame(f3, bg=PANEL_BG)
-        grav_row.pack(fill=tk.X, pady=(4, 0))
-        tk.Label(grav_row, text="重力方向:", bg=PANEL_BG, fg="#aaaaaa",
-                 font=("Helvetica", 8)).pack(side=tk.LEFT)
-        self._lbl_gravity = tk.Label(grav_row, text="計算中...",
-                                      bg=PANEL_BG, fg="#88aaff",
-                                      font=("Courier", 8))
-        self._lbl_gravity.pack(side=tk.LEFT, padx=4)
-
-        # ── 4. 姿勢推定 ──
-        f4 = section("4. 姿勢推定")
-        tk.Label(f4, text="↑ 画像をクリックして物体選択",
-                 bg=PANEL_BG, fg="#888888", font=("Helvetica", 8)).pack(anchor="w")
-        add_btn(f4, "→  計算機へ送信・姿勢推定", self._on_estimate, "estimate")
-        add_btn(f4, "→  把持姿勢生成",           self._on_grasp,    "grasp")
-
-        # ── 5. アーム制御 ──
-        f5 = section("5. アーム制御")
-        add_btn(f5, "▶  両アームを移動",   self._on_move,        "move",       color="#3d5b7a")
-        add_btn(f5, "▶  左アームのみ移動", self._on_move_left,   "move_left",  color="#3a547a")
-        add_btn(f5, "▶  右アームのみ移動", self._on_move_right,  "move_right", color="#3a547a")
-        add_btn(f5, "○  グリッパ 開",     self._on_gripper_open,  "g_open")
-        add_btn(f5, "●  グリッパ 閉",     self._on_gripper_close, "g_close")
-        add_btn(f5, "⌂  初期姿勢へ",      self._on_home,          "home")
-
-        # 座標表示
-        fr = section("把持座標 (base_link) [m]")
-        self._lbl_lh    = tk.Label(fr, text="左手首: -", bg=PANEL_BG, fg="#aaffaa",
-                                    font=("Courier", 8), anchor="w")
-        self._lbl_lh.pack(fill=tk.X)
-        self._lbl_rh    = tk.Label(fr, text="右手首: -", bg=PANEL_BG, fg="#aaffaa",
-                                    font=("Courier", 8), anchor="w")
-        self._lbl_rh.pack(fill=tk.X)
-        self._lbl_click = tk.Label(fr, text="選択点: -", bg=PANEL_BG, fg="#ffaaaa",
-                                    font=("Courier", 8), anchor="w")
-        self._lbl_click.pack(fill=tk.X)
-
-        self._lbl_status = tk.Label(left, text="● 待機中",
-                                     bg=BG, fg="#888888",
-                                     font=("Helvetica", 9), anchor="w")
-        self._lbl_status.pack(fill=tk.X, pady=(6, 0))
-
-        # ── 右: カメラビュー + ログ ──
-        right = tk.Frame(root, bg=BG)
-        right.grid(row=1, column=1, sticky="nsew", padx=(4, 8), pady=4)
-
-        cam_lf = tk.LabelFrame(right,
+        # ── カメラ映像 ──
+        cam_lf = tk.LabelFrame(root,
                                 text="カメラ映像  ←  凍結後にクリックで物体選択",
                                 bg=BG, fg="#bbbbbb", font=("Helvetica", 9, "bold"))
-        cam_lf.pack(fill=tk.X)
+        cam_lf.pack(padx=8)
 
         self._canvas = tk.Canvas(cam_lf, width=CANVAS_W, height=CANVAS_H, bg="black")
         self._canvas.pack()
         self._canvas.bind("<Button-1>", self._on_canvas_click)
         self._canvas_img_id = None
 
-        log_lf = tk.LabelFrame(right, text="ログ",
-                                bg=BG, fg="#bbbbbb", font=("Helvetica", 9, "bold"))
-        log_lf.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
-        self._log_area = scrolledtext.ScrolledText(
-            log_lf, width=82, height=8,
-            bg=LOG_BG, fg=LOG_FG, font=("Courier", 9),
-            state=tk.DISABLED, wrap=tk.WORD,
-        )
-        self._log_area.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        # ── 下部パネル (セクション横並び) ──
+        bottom = tk.Frame(root, bg=BG)
+        bottom.pack(fill=tk.X, padx=8, pady=(4, 8))
+
+        # 1. 起動
+        f1 = section("1. 起動")
+        add_btn(f1, "▶  sciurus17 起動", self._on_launch, "launch", color="#3d6b3d")
+        add_btn(f1, "■  停止",           self._on_kill,   "kill",   color="#6b3d3d")
+
+        # 2. カメラ・頭部制御
+        f2 = section("2. カメラ・頭部制御")
+        add_btn(f2, "▶  カメラ接続", self._on_connect_camera, "cam_connect")
+        tk.Frame(f2, height=1, bg="#555555").pack(fill=tk.X, pady=4)
+        self._neck_yaw_var   = tk.DoubleVar(value=0.0)
+        self._neck_pitch_var = tk.DoubleVar(value=getattr(self.args, "neck_pitch", 0.0))
+        spinrow(f2, "ヨー [deg] (左+):",   self._neck_yaw_var,   -90, 90)
+        spinrow(f2, "ピッチ [deg] (下+):", self._neck_pitch_var, -90, 90,
+                cmd=self._on_neck_pitch_change)
+        add_btn(f2, "↓  首を動かす",    self._on_head_move, "head_move")
+        add_btn(f2, "↑  首を初期位置へ", self._on_head_home, "head_home")
+        grav_row = tk.Frame(f2, bg=PANEL_BG)
+        grav_row.pack(fill=tk.X, pady=(4, 0))
+        tk.Label(grav_row, text="重力:", bg=PANEL_BG, fg="#aaaaaa",
+                 font=("Helvetica", 8)).pack(side=tk.LEFT)
+        self._lbl_gravity = tk.Label(grav_row, text="計算中...",
+                                      bg=PANEL_BG, fg="#88aaff", font=("Courier", 8))
+        self._lbl_gravity.pack(side=tk.LEFT, padx=4)
+        tk.Frame(f2, height=1, bg="#555555").pack(fill=tk.X, pady=4)
+        add_btn(f2, "フレーム取得",  self._on_capture,   "capture")
+        add_btn(f2, "Log",          self._open_log_win, "log_btn")
+
+        # 3. 姿勢推定
+        f4 = section("3. 姿勢推定")
+        tk.Label(f4, text="画像クリックで物体を選択",
+                 bg=PANEL_BG, fg="#888888", font=("Helvetica", 8)).pack(anchor="w")
+        add_btn(f4, "→  計算機へ送信・姿勢推定", self._on_estimate, "estimate")
+        add_btn(f4, "→  把持姿勢生成",           self._on_grasp,    "grasp")
+
+        # 4. アーム制御
+        f5 = section("4. アーム制御")
+        add_btn(f5, "▶  両アームを移動",   self._on_move,          "move",       color="#3d5b7a")
+        add_btn(f5, "▶  左アームのみ",     self._on_move_left,     "move_left",  color="#3a547a")
+        add_btn(f5, "▶  右アームのみ",     self._on_move_right,    "move_right", color="#3a547a")
+        add_btn(f5, "○  グリッパ 開",     self._on_gripper_open,  "g_open")
+        add_btn(f5, "●  グリッパ 閉",     self._on_gripper_close, "g_close")
+        add_btn(f5, "⌂  初期姿勢へ",      self._on_home,          "home")
+
+        # 把持座標 + ステータス
+        fr = section("把持座標 [m]")
+        self._lbl_lh    = tk.Label(fr, text="左手首: -", bg=PANEL_BG, fg="#aaffaa",
+                                    font=("Courier", 9), anchor="w")
+        self._lbl_lh.pack(fill=tk.X)
+        self._lbl_rh    = tk.Label(fr, text="右手首: -", bg=PANEL_BG, fg="#aaffaa",
+                                    font=("Courier", 9), anchor="w")
+        self._lbl_rh.pack(fill=tk.X)
+        self._lbl_click = tk.Label(fr, text="選択点: -", bg=PANEL_BG, fg="#ffaaaa",
+                                    font=("Courier", 9), anchor="w")
+        self._lbl_click.pack(fill=tk.X)
+        self._lbl_status = tk.Label(fr, text="● 待機中", bg=PANEL_BG, fg="#888888",
+                                     font=("Helvetica", 9), anchor="w")
+        self._lbl_status.pack(fill=tk.X, pady=(8, 0))
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -749,10 +776,8 @@ class SciurusGUI:
         try:
             while True:
                 msg = self._log_q.get_nowait()
-                self._log_area.configure(state=tk.NORMAL)
-                self._log_area.insert(tk.END, msg)
-                self._log_area.see(tk.END)
-                self._log_area.configure(state=tk.DISABLED)
+                if self._log_win is not None:
+                    self._log_win.append(msg)
         except queue.Empty:
             pass
         self.root.after(100, self._poll_log)
@@ -842,6 +867,7 @@ class SciurusGUI:
             "g_open":      can_arm,
             "g_close":     can_arm,
             "home":        can_arm,
+            "log_btn":     True,
         }
         for key, btn in self._btns.items():
             btn.config(state=tk.NORMAL if enabled.get(key, False) else tk.DISABLED)
@@ -911,6 +937,34 @@ class SciurusGUI:
             self._log("[停止] 起動済みプロセスがありません")
 
     def _on_connect_camera(self):
+        self._log("カメラ起動中...")
+        self._run_bg(self._do_connect_camera)
+
+    def _do_connect_camera(self):
+        if self.args.demo:
+            self._set_state(S_CAMERA)
+            return
+        cam_cmd = self.args.camera_launch_cmd
+        if cam_cmd and (self._camera_process is None or self._camera_process.poll() is not None):
+            self._log(f"[カメラ] {cam_cmd}")
+            try:
+                self._camera_process = subprocess.Popen(
+                    cam_cmd, shell=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1,
+                )
+                def _read():
+                    for line in self._camera_process.stdout:
+                        self._log(f"[CAM] {line.rstrip()}")
+                threading.Thread(target=_read, daemon=True).start()
+                # トピックが来るまで最大10秒待つ
+                for _ in range(20):
+                    time.sleep(0.5)
+                    if self.node.get_latest_rgb() is not None:
+                        break
+            except Exception as e:
+                self._log(f"[カメラ起動エラー] {e}")
+                return
         self._log("カメラ映像受信開始...")
         self._set_state(S_CAMERA)
 
@@ -947,11 +1001,12 @@ class SciurusGUI:
         plan_p   = self._make_plan_params(robot, vel=0.3)
         head_comp = robot.get_planning_component(self.args.head_group)
         model    = robot.get_robot_model()
+        from moveit.core.robot_state import RobotState
         rs       = RobotState(model)
-        rs.set_joint_positions({
-            self.args.neck_yaw_joint:   math.radians(yaw_deg),
-            self.args.neck_pitch_joint: math.radians(pitch_deg),
-        })
+        rs.set_joint_group_positions(
+            self.args.head_group,
+            [math.radians(yaw_deg), math.radians(pitch_deg)],
+        )
         head_comp.set_start_state_to_current_state()
         head_comp.set_goal_state(robot_state=rs)
         _plan_and_execute(robot, head_comp, self._log, plan_p)
@@ -970,7 +1025,7 @@ class SciurusGUI:
         plan_p   = self._make_plan_params(robot, vel=0.3)
         head_comp = robot.get_planning_component(self.args.head_group)
         head_comp.set_start_state_to_current_state()
-        head_comp.set_goal_state(configuration_name="head_init_pose")
+        head_comp.set_goal_state(configuration_name="neck_init_pose")
         _plan_and_execute(robot, head_comp, self._log, plan_p)
         self._log("[頭部] 初期位置へ移動完了")
 
@@ -1167,6 +1222,7 @@ class SciurusGUI:
         q_r = Quaternion(x=0.707,  y=0.0, z=0.0, w=0.707)
 
         def set_gripper(comp, group, angle):
+            from moveit.core.robot_state import RobotState
             rs = RobotState(robot_model)
             rs.set_joint_group_positions(group, [angle])
             comp.set_start_state_to_current_state()
@@ -1229,6 +1285,7 @@ class SciurusGUI:
         model    = robot.get_robot_model()
 
         def set_gripper(angle):
+            from moveit.core.robot_state import RobotState
             rs = RobotState(model)
             rs.set_joint_group_positions(gripper_name, [angle])
             gripper.set_start_state_to_current_state()
@@ -1344,6 +1401,7 @@ class SciurusGUI:
             ("l_gripper_group", "l_gripper_group", angles[0]),
             ("r_gripper_group", "r_gripper_group", angles[1]),
         ):
+            from moveit.core.robot_state import RobotState
             comp = robot.get_planning_component(comp_name)
             rs   = RobotState(model)
             rs.set_joint_group_positions(group, [angle])
@@ -1377,14 +1435,37 @@ class SciurusGUI:
     def _get_robot(self):
         if not _MOVEIT_OK:
             raise RuntimeError("MoveItPy が利用できません (ROS2 環境で実行してください)")
+        if self._process is None or self._process.poll() is not None:
+            raise RuntimeError(
+                "先に「▶ sciurus17 起動」ボタンを押して、"
+                "RViz が開くまで 30 秒以上待ってから操作してください"
+            )
         if self._robot is None:
             self._log("MoveItPy 初期化中 (数秒かかります)...")
-            self._robot = MoveItPy(node_name="sciurus17_gui_moveit")
+            from moveit.planning import MoveItPy, PlanRequestParameters
+            from ament_index_python.packages import get_package_share_directory
+            from moveit_configs_utils import MoveItConfigsBuilder
+            moveit_py_yaml = (
+                get_package_share_directory("sciurus17_examples_py")
+                + "/config/sciurus17_moveit_py_examples.yaml"
+            )
+            cfg = (
+                MoveItConfigsBuilder("sciurus17")
+                .planning_scene_monitor(
+                    publish_robot_description=True,
+                    publish_robot_description_semantic=True,
+                )
+                .moveit_cpp(file_path=moveit_py_yaml)
+                .to_moveit_configs()
+            )
+            self._robot = MoveItPy(node_name="sciurus17_gui_moveit",
+                                   config_dict=cfg.to_dict())
             self._log("MoveItPy 初期化完了")
         return self._robot
 
     @staticmethod
     def _make_plan_params(robot, vel=0.1):
+        from moveit.planning import PlanRequestParameters
         p = PlanRequestParameters(robot, "ompl_rrtc_default")
         p.max_velocity_scaling_factor     = vel
         p.max_acceleration_scaling_factor = vel
@@ -1420,11 +1501,11 @@ def main():
     parser.add_argument("--model-epoch", type=int, default=69)
 
     parser.add_argument("--color-topic",
-                        default="/sciurus17/camera/color/image_raw")
+                        default="/head_camera/color/image_raw")
     parser.add_argument("--depth-topic",
-                        default="/sciurus17/camera/aligned_depth_to_color/image_raw")
+                        default="/head_camera/aligned_depth_to_color/image_raw")
     parser.add_argument("--info-topic",
-                        default="/sciurus17/camera/color/camera_info")
+                        default="/head_camera/color/camera_info")
     parser.add_argument("--depth-scale", type=float, default=0.001)
 
     parser.add_argument("--camera-frame", default="camera_color_optical_frame")
@@ -1436,15 +1517,18 @@ def main():
     parser.add_argument("--pre-grasp-z-offset", type=float, default=0.10)
 
     # 頭部制御
-    parser.add_argument("--head-group",        default="head_group",
+    parser.add_argument("--head-group",        default="neck_group",
                         help="頭部 MoveIt planning group 名")
-    parser.add_argument("--neck-yaw-joint",    default="neck_joint_1",
+    parser.add_argument("--neck-yaw-joint",    default="neck_yaw_joint",
                         help="頭部ヨー関節名 (sciurus17 SRDF に合わせて設定)")
-    parser.add_argument("--neck-pitch-joint",  default="neck_joint_2",
+    parser.add_argument("--neck-pitch-joint",  default="neck_pitch_joint",
                         help="頭部ピッチ関節名 (sciurus17 SRDF に合わせて設定)")
 
     parser.add_argument("--launch-cmd", default="",
                         help="sciurus17 起動コマンド (例: ros2 launch ...)")
+    parser.add_argument("--camera-launch-cmd",
+                        default="ros2 launch sciurus17_vision head_camera.launch.py",
+                        help="カメラ起動コマンド (カメラ接続ボタンで実行)")
 
     args = parser.parse_args()
 

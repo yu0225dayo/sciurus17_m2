@@ -16,7 +16,7 @@ services:
       # ROS2 ワークスペース
       - ./ws:/ros2_ws
       # robo_ros プロジェクト全体 (ros/, client/ へのアクセス用)
-      - ..:/robo_ros
+      - ..:/sciurus17_m2
       # WSLg のソケット (GUI表示用)
       - /tmp/.X11-unix:/tmp/.X11-unix
       - /mnt/wslg:/mnt/wslg
