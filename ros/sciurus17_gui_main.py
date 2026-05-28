@@ -125,6 +125,22 @@ LOG_FG   = "#cccccc"
 
 # ── ユーティリティ ─────────────────────────────────────────────────────────────
 
+def _euler_to_quaternion(roll_deg: float, pitch_deg: float, yaw_deg: float) -> "Quaternion":
+    """Convert RPY degrees to geometry_msgs/Quaternion."""
+    r = math.radians(roll_deg)
+    p = math.radians(pitch_deg)
+    y = math.radians(yaw_deg)
+    cr, sr = math.cos(r / 2), math.sin(r / 2)
+    cp, sp = math.cos(p / 2), math.sin(p / 2)
+    cy, sy = math.cos(y / 2), math.sin(y / 2)
+    return Quaternion(
+        x=sr * cp * cy - cr * sp * sy,
+        y=cr * sp * cy + sr * cp * sy,
+        z=cr * cp * sy - sr * sp * cy,
+        w=cr * cp * cy + sr * sp * sy,
+    )
+
+
 def _gravity_from_neck_pitch(neck_pitch_deg: float) -> np.ndarray:
     """
     首ピッチ角（下向き正）からカメラ座標系での重力方向を計算する。
@@ -488,6 +504,43 @@ if _ROS2_OK:
             arm_comp.set_goal_state(pose_stamped_msg=goal, pose_link=pose_link)
             return _plan_and_execute(robot, arm_comp, self.get_logger().error, params)
 
+        def move_arm_wrist(self, robot, arm_comp, params,
+                           roll: float, pitch: float, yaw: float,
+                           pose_link: str) -> bool:
+            """Keep the current EEF position and set an absolute base_link RPY pose."""
+            with robot.get_planning_scene_monitor().read_only() as scene:
+                rs = scene.current_state
+                rs.update()
+                tf_mat = rs.get_global_link_transform(pose_link)
+
+            x, y, z = float(tf_mat[0, 3]), float(tf_mat[1, 3]), float(tf_mat[2, 3])
+            self.get_logger().info(
+                f"[wrist] {pose_link} current position: ({x:.3f}, {y:.3f}, {z:.3f})")
+
+            for step_idx, (r, p, yw, label) in enumerate([
+                (0.0, 0.0, yaw, f"Yaw={math.degrees(yaw):.1f} deg"),
+                (0.0, pitch, yaw, f"+Pitch={math.degrees(pitch):.1f} deg"),
+                (roll, pitch, yaw, f"+Roll={math.degrees(roll):.1f} deg"),
+            ]):
+                goal = PoseStamped()
+                goal.header.frame_id = "base_link"
+                goal.pose.position.x = x
+                goal.pose.position.y = y
+                goal.pose.position.z = z
+                goal.pose.orientation = _euler_to_quaternion(
+                    math.degrees(r), math.degrees(p), math.degrees(yw))
+
+                self.get_logger().info(f"[wrist] step{step_idx + 1}/3 {label}")
+                arm_comp.set_start_state_to_current_state()
+                arm_comp.set_goal_state(pose_stamped_msg=goal, pose_link=pose_link)
+                ok = _plan_and_execute(robot, arm_comp, self.get_logger().error, params)
+                time.sleep(0.3)
+                if not ok:
+                    self.get_logger().error(f"[wrist] failed at {label}")
+                    return False
+
+            return True
+
 
 # ── デモノード (ROS2 不要) ────────────────────────────────────────────────────
 
@@ -590,6 +643,12 @@ class DemoRobotNode:
         pass  # デモモードでは ROS なし
 
     def move_arm(self, robot, arm_comp, params, xyz_base, pose_link, orientation) -> bool:
+        time.sleep(0.5)
+        return True
+
+    def move_arm_wrist(self, robot, arm_comp, params,
+                       roll: float, pitch: float, yaw: float,
+                       pose_link: str) -> bool:
         time.sleep(0.5)
         return True
 
@@ -779,6 +838,28 @@ class SciurusGUI:
         spinrow(f5, "X offset [m]:", self._offset_x_var, -0.5, 0.5, incr=0.01, fmt="%.2f")
         spinrow(f5, "Y offset [m]:", self._offset_y_var, -0.5, 0.5, incr=0.01, fmt="%.2f")
         spinrow(f5, "Z offset [m]:", self._offset_z_var, -0.5, 0.5, incr=0.01, fmt="%.2f")
+        tk.Frame(f5, height=1, bg="#555555").pack(fill=tk.X, pady=4)
+        self._l_yaw_var   = tk.DoubleVar(value=0.0)
+        self._l_pitch_var = tk.DoubleVar(value=0.0)
+        self._l_roll_var  = tk.DoubleVar(value=0.0)
+        tk.Label(f5, text="左アーム回転 (base_link絶対RPY)",
+                 bg=PANEL_BG, fg="#aaffaa",
+                 font=("Helvetica", 8, "bold")).pack(anchor="w")
+        spinrow(f5, "左 ΔYaw   [deg]:", self._l_yaw_var,   -180, 180, 5.0, "%.0f")
+        spinrow(f5, "左 ΔPitch [deg]:", self._l_pitch_var, -180, 180, 5.0, "%.0f")
+        spinrow(f5, "左 ΔRoll  [deg]:", self._l_roll_var,  -180, 180, 5.0, "%.0f")
+        add_btn(f5, "↻  左アーム回転", self._on_rotate_left, "rotate_left", color="#3a5a4a")
+        self._r_yaw_var   = tk.DoubleVar(value=0.0)
+        self._r_pitch_var = tk.DoubleVar(value=0.0)
+        self._r_roll_var  = tk.DoubleVar(value=0.0)
+        tk.Label(f5, text="右アーム回転 (base_link絶対RPY)",
+                 bg=PANEL_BG, fg="#ffaaaa",
+                 font=("Helvetica", 8, "bold")).pack(anchor="w", pady=(4, 0))
+        spinrow(f5, "右 ΔYaw   [deg]:", self._r_yaw_var,   -180, 180, 5.0, "%.0f")
+        spinrow(f5, "右 ΔPitch [deg]:", self._r_pitch_var, -180, 180, 5.0, "%.0f")
+        spinrow(f5, "右 ΔRoll  [deg]:", self._r_roll_var,  -180, 180, 5.0, "%.0f")
+        add_btn(f5, "↻  右アーム回転", self._on_rotate_right, "rotate_right", color="#5a3a4a")
+        tk.Frame(f5, height=1, bg="#555555").pack(fill=tk.X, pady=4)
         add_btn(f5, "⟳  マーカー更新",     self._republish_goal_markers, "marker_update", color="#4a4a2a")
         add_btn(f5, "▶  両アームを移動",   self._on_move,          "move",       color="#3d5b7a")
         add_btn(f5, "▶  左アームのみ",     self._on_move_left,     "move_left",  color="#3a547a")
@@ -908,6 +989,8 @@ class SciurusGUI:
             "move":        s == S_DONE and not w,
             "move_left":   s == S_DONE and not w,
             "move_right":  s == S_DONE and not w,
+            "rotate_left":  s == S_DONE and not w,
+            "rotate_right": s == S_DONE and not w,
             "g_open":      can_arm,
             "g_close":     can_arm,
             "home":        can_arm,
@@ -1294,6 +1377,20 @@ class SciurusGUI:
             on_error_state=S_DONE,
         )
 
+    def _on_rotate_left(self):
+        self._set_state(S_MOVING)
+        self._run_bg(
+            self._do_rotate_left_demo if self.args.demo else self._do_rotate_left,
+            on_error_state=S_DONE,
+        )
+
+    def _on_rotate_right(self):
+        self._set_state(S_MOVING)
+        self._run_bg(
+            self._do_rotate_right_demo if self.args.demo else self._do_rotate_right,
+            on_error_state=S_DONE,
+        )
+
     def _do_move(self):
         """両アームを把持位置へ移動する。"""
         robot = self._get_robot()
@@ -1460,6 +1557,57 @@ class SciurusGUI:
         self.root.after(0, lambda: self._set_state(S_DONE))
 
     # ──────────────────────── グリッパ / 初期姿勢 ──────────────────────────────
+
+    def _do_rotate_left_demo(self):
+        self._log(
+            f"[Demo left arm rotation] R={self._l_roll_var.get():.0f} deg "
+            f"P={self._l_pitch_var.get():.0f} deg Y={self._l_yaw_var.get():.0f} deg")
+        time.sleep(0.8)
+        self.root.after(0, lambda: self._set_state(S_DONE))
+
+    def _do_rotate_right_demo(self):
+        self._log(
+            f"[Demo right arm rotation] R={self._r_roll_var.get():.0f} deg "
+            f"P={self._r_pitch_var.get():.0f} deg Y={self._r_yaw_var.get():.0f} deg")
+        time.sleep(0.8)
+        self.root.after(0, lambda: self._set_state(S_DONE))
+
+    def _do_rotate_left(self):
+        self._do_rotate_arm("left")
+
+    def _do_rotate_right(self):
+        self._do_rotate_arm("right")
+
+    def _do_rotate_arm(self, side: str):
+        robot = self._get_robot()
+        plan_p = self._make_plan_params(robot, vel=0.05)
+        if side == "left":
+            arm_group = self.args.l_arm_group
+            pose_link = self.args.l_pose_link
+            roll = self._l_roll_var.get()
+            pitch = self._l_pitch_var.get()
+            yaw = self._l_yaw_var.get()
+        else:
+            arm_group = self.args.r_arm_group
+            pose_link = self.args.r_pose_link
+            roll = self._r_roll_var.get()
+            pitch = self._r_pitch_var.get()
+            yaw = self._r_yaw_var.get()
+
+        arm = robot.get_planning_component(arm_group)
+        self._log(
+            f"[{side} arm rotation] R={roll:.0f} deg P={pitch:.0f} deg "
+            f"Y={yaw:.0f} deg (absolute base_link, Yaw -> Pitch -> Roll)")
+        ok = self.node.move_arm_wrist(
+            robot, arm, plan_p,
+            math.radians(roll), math.radians(pitch), math.radians(yaw),
+            pose_link,
+        )
+        if ok:
+            self._log(f"[{side} arm rotation done]")
+        else:
+            self._log(f"[{side} arm rotation failed]")
+        self.root.after(0, lambda: self._set_state(S_DONE))
 
     def _on_gripper_open(self):
         self._run_bg(self._do_gripper, "open")
