@@ -42,9 +42,9 @@ exit
 # 実カメラ不要。保存 RGBD を使って把持姿勢を生成し、仮想ロボットで動作確認できる
 
 docker compose run --rm sciurus17 \
-    python3 /robo_ros/ros/sciurus17_gui_rviz.py \
-    --rviz-image /robo_ros/client/saved_data/test_20260422_200416 \
-    --server-url http://10.40.1.126:8082
+    python3 /sciurus17_m2/ros/sciurus17_gui_rviz.py \
+    --rviz-image /sciurus17_m2/client/saved_data/test_20260422_200416 \
+    --server-url http://10.40.1.126:8080
 
 # GUI 操作手順:
 #   1. 「▶ sciurus17 起動」ボタンを押す → RViz が開くまで 20〜40 秒待つ

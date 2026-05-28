@@ -8,10 +8,12 @@ demo.launch.py (use_mock_components:=true) で RViz を起動し、
 把持計画は MoveItPy で実行され、仮想ロボットの軌道が RViz で可視化される。
 
 起動 (sciurus17/ ディレクトリで):
-  docker compose run --rm sciurus17 \
-      python3 /sciurus17_m2/ros/sciurus17_gui_rviz.py \
-      --rviz-image /sciurus17_m2/client/saved_data/test_20260422_200416 \
-      --server-url http://10.40.1.126:8080
+  docker compose run --rm sciurus17 \\
+      python3 /sciurus17_m2/ros/sciurus17_gui_rviz2.py
+      --rviz-image /sciurus17_m2d_data/test_20260422_200416 \\
+      --server-url http://10.40.1.126:8082
+
+docker compose run --rm sciurus17     python3 /sciurus17_m2/ros/sciurus17_gui_rviz2.py     --rviz-image /sciurus17_m2/client/saved_data/test_20260422_200416     --server-url http://10.40.1.115:8082
 
 操作フロー:
   1. [sciurus17 起動] → demo.launch.py (use_mock_components:=true) + RViz 起動
@@ -41,6 +43,7 @@ from tkinter import scrolledtext
 
 import cv2
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 try:
     from PIL import Image, ImageTk
@@ -60,6 +63,7 @@ try:
     from sensor_msgs.msg import CameraInfo
     from sensor_msgs.msg import Image as RosImage
     from visualization_msgs.msg import Marker, MarkerArray
+    from moveit_msgs.msg import DisplayTrajectory
     _ROS2_OK = True
 except ImportError as e:
     print(f"[エラー] ROS2 が見つかりません: {e}")
@@ -119,9 +123,67 @@ LOG_FG   = "#cccccc"
 
 # ── ユーティリティ ─────────────────────────────────────────────────────────────
 
+def _euler_to_quaternion(roll_deg: float, pitch_deg: float, yaw_deg: float) -> "Quaternion":
+    """RPY (ZYX convention) → geometry_msgs/Quaternion"""
+    r = math.radians(roll_deg)
+    p = math.radians(pitch_deg)
+    y = math.radians(yaw_deg)
+    cr, sr = math.cos(r / 2), math.sin(r / 2)
+    cp, sp = math.cos(p / 2), math.sin(p / 2)
+    cy, sy = math.cos(y / 2), math.sin(y / 2)
+    return Quaternion(
+        x=sr * cp * cy - cr * sp * sy,
+        y=cr * sp * cy + sr * cp * sy,
+        z=cr * cp * sy - sr * sp * cy,
+        w=cr * cp * cy + sr * sp * sy,
+    )
+
+
+
 def _gravity_from_neck_pitch(neck_pitch_deg: float) -> np.ndarray:
     theta = math.radians(neck_pitch_deg)
     return np.array([0.0, -math.cos(theta), -math.sin(theta)], dtype=np.float32)
+
+
+# ── パームフレーム → グリッパ回転角 ────────────────────────────────────────────
+# カメラ光学座標系 (x=右, y=下, z=奥) → base_link (x=前, y=左, z=上) 回転行列
+_R_CAM_OPT_TO_BASE = np.array([
+    [ 0,  0,  1],
+    [-1,  0,  0],
+    [ 0, -1,  0],
+], dtype=np.float64)
+
+_J_G_WRIST      = 0
+_J_G_INDEX_MCP  = 5
+_J_G_MIDDLE_MCP = 8
+_J_G_PINKY_MCP  = 14
+
+
+def _compute_palm_frame(joints: np.ndarray, flip_z: bool) -> np.ndarray:
+    """23関節座標からパームフレーム回転行列 R (3x3, カメラ座標系) を返す。
+    左手: flip_z=False  右手: flip_z=True
+    """
+    wrist  = joints[_J_G_WRIST]
+    v_idx  = joints[_J_G_INDEX_MCP]  - wrist
+    v_pin  = joints[_J_G_PINKY_MCP]  - wrist
+    v_mid  = joints[_J_G_MIDDLE_MCP] - wrist
+    z_axis = np.cross(v_idx, v_pin)
+    z_axis /= np.linalg.norm(z_axis)
+    if flip_z:
+        z_axis = -z_axis
+    x_raw  = v_mid / np.linalg.norm(v_mid)
+    x_axis = x_raw - np.dot(x_raw, z_axis) * z_axis
+    x_axis /= np.linalg.norm(x_axis)
+    y_axis = np.cross(z_axis, x_axis)
+    return np.column_stack([x_axis, y_axis, z_axis])
+
+
+def _palm_to_gripper_euler(joints: np.ndarray, flip_z: bool):
+    """カメラ座標系の23関節 → base_link 基準 ZYX Euler角 [deg] (yaw, pitch, roll)"""
+    R_cam  = _compute_palm_frame(joints, flip_z)
+    R_base = _R_CAM_OPT_TO_BASE @ R_cam
+    yaw, pitch, roll = Rotation.from_matrix(R_base).as_euler('ZYX', degrees=True)
+    return float(yaw), float(pitch), float(roll)
 
 
 def _project(xyz, intr):
@@ -306,6 +368,17 @@ class LogWindow:
         self.win.lift()
 
 
+def _remove_display_motion_path(cfg: dict):
+    """MoveItPy の config dict から DisplayMotionPath アダプターを再帰的に除去する。"""
+    for key, value in cfg.items():
+        if isinstance(value, dict):
+            _remove_display_motion_path(value)
+        elif isinstance(value, list):
+            cfg[key] = [v for v in value if 'DisplayMotionPath' not in str(v)]
+        elif isinstance(value, str) and 'DisplayMotionPath' in value:
+            cfg[key] = ' '.join(v for v in value.split() if 'DisplayMotionPath' not in v)
+
+
 def _plan_and_execute(robot, comp, log_fn, params) -> bool:
     result = comp.plan(single_plan_parameters=params)
     if result:
@@ -375,8 +448,15 @@ class RvizRobotNode(Node):
             reliability=QoSReliabilityPolicy.RELIABLE,
         )
         self._pub_markers = self.create_publisher(MarkerArray, "/grasp_markers", _marker_qos)
+        self._pub_joint_markers = self.create_publisher(MarkerArray, "/joint_markers", _marker_qos)
         # 起動後 1s で DELETEALL を送り、RViz がトピックを認識できるようにする
         self._marker_init_timer = self.create_timer(1.0, self._init_markers_once)
+
+        # RViz のゴール姿勢ゴースト消去用 (TRANSIENT_LOCAL で確実に受信させる)
+        self._pub_display_path = self.create_publisher(
+            DisplayTrajectory, '/display_planned_path', _marker_qos)
+        # 起動後 1s で前回セッションのオレンジゴーストを消去する
+        self._display_path_init_timer = self.create_timer(1.0, self._init_display_path_once)
 
         self._load_saved_image(image_dir)
 
@@ -396,6 +476,12 @@ class RvizRobotNode(Node):
         self._pub_markers.publish(arr)
         self._marker_init_timer.cancel()
         self.get_logger().info("[marker] 起動初期化: /grasp_markers DELETEALL 送信済み")
+
+    def _init_display_path_once(self):
+        """起動後 1s で前回セッションのオレンジゴースト (planned path) を消去する。"""
+        self.clear_planned_path()
+        self._display_path_init_timer.cancel()
+        self.get_logger().info("[display_path] 起動初期化: /display_planned_path クリア済み")
 
     def _publish_camera_static_tf(self):
         """head_camera_color_optical_frame を TF ツリーへ登録する (base_link 基準固定値)。"""
@@ -611,20 +697,143 @@ class RvizRobotNode(Node):
         self._pub_markers.publish(arr)
         self.get_logger().info("[marker] 把持目標マーカを /grasp_markers へ配信しました")
 
-    def move_arm(self, robot, arm_comp, params, xyz_base, pose_link: str,
-                 orientation) -> bool:
-        """MoveItPy で目標位置へ移動。軌道は RViz で可視化される。"""
+    def publish_joint_markers(self, robot):
+        """FK で各関節リンク位置を /joint_markers へ球体+ラベルで配信する。"""
+        try:
+            with robot.get_planning_scene_monitor().read_only() as scene:
+                rs = scene.current_state
+                rs.update()
+
+                arr = MarkerArray()
+                now = self.get_clock().now().to_msg()
+                mid = 0
+
+                for prefix, r_c, g_c, b_c in [
+                    ("l", 0.1, 0.9, 0.1),   # 左: 緑
+                    ("r", 0.9, 0.5, 0.1),   # 右: 橙
+                ]:
+                    for i in range(1, 8):
+                        link_name = f"{prefix}_link{i}"
+                        try:
+                            tf_mat = rs.get_global_link_transform(link_name)
+                        except Exception:
+                            mid += 1
+                            continue
+                        x = float(tf_mat[0, 3])
+                        y = float(tf_mat[1, 3])
+                        z = float(tf_mat[2, 3])
+
+                        # 球体 (EEF=joint7 は少し大きく)
+                        m = Marker()
+                        m.header.frame_id = "base_link"
+                        m.header.stamp = now
+                        m.ns = "joint_sphere"
+                        m.id = mid
+                        m.type = Marker.SPHERE
+                        m.action = Marker.ADD
+                        m.pose.position.x = x
+                        m.pose.position.y = y
+                        m.pose.position.z = z
+                        m.pose.orientation.w = 1.0
+                        m.scale.x = m.scale.y = m.scale.z = 0.04 if i == 7 else 0.025
+                        m.color.r = r_c; m.color.g = g_c; m.color.b = b_c
+                        m.color.a = 0.85
+                        m.lifetime.sec = 0
+                        arr.markers.append(m)
+
+                        # ラベル
+                        t = Marker()
+                        t.header.frame_id = "base_link"
+                        t.header.stamp = now
+                        t.ns = "joint_label"
+                        t.id = mid
+                        t.type = Marker.TEXT_VIEW_FACING
+                        t.action = Marker.ADD
+                        t.pose.position.x = x
+                        t.pose.position.y = y
+                        t.pose.position.z = z + 0.04
+                        t.pose.orientation.w = 1.0
+                        t.scale.z = 0.025
+                        t.color.r = t.color.g = t.color.b = 1.0
+                        t.color.a = 1.0
+                        t.text = f"{prefix.upper()}{i}({x:+.2f},{y:+.2f},{z:+.2f})"
+                        t.lifetime.sec = 0
+                        arr.markers.append(t)
+
+                        mid += 1
+
+            self._pub_joint_markers.publish(arr)
+            self.get_logger().info("[marker] 関節マーカを /joint_markers へ配信しました")
+        except Exception as e:
+            self.get_logger().warn(f"[marker] 関節マーカ配信失敗: {e}")
+
+    def clear_planned_path(self):
+        """RViz のゴール姿勢ゴースト（計画済み軌道表示）を消去する。"""
+        self._pub_display_path.publish(DisplayTrajectory())
+
+    def move_arm(self, robot, arm_comp, params, xyz_base, pose_link: str) -> bool:
+        """MoveItPy で目標位置へ移動。向きは現在値を維持。軌道は RViz で可視化される。"""
+        with robot.get_planning_scene_monitor().read_only() as scene:
+            rs = scene.current_state
+            rs.update()
+            tf_mat = rs.get_global_link_transform(pose_link)
+        rot = Rotation.from_matrix(np.asarray(tf_mat)[:3, :3].astype(np.float64))
+        qx, qy, qz, qw = rot.as_quat()
         goal = PoseStamped()
         goal.header.frame_id = "base_link"
         goal.pose = Pose(
             position=Point(x=float(xyz_base[0]),
                            y=float(xyz_base[1]),
                            z=float(xyz_base[2])),
-            orientation=orientation,
+            orientation=Quaternion(x=float(qx), y=float(qy), z=float(qz), w=float(qw)),
         )
         arm_comp.set_start_state_to_current_state()
         arm_comp.set_goal_state(pose_stamped_msg=goal, pose_link=pose_link)
-        return _plan_and_execute(robot, arm_comp, self.get_logger().error, params)
+        ok = _plan_and_execute(robot, arm_comp, self.get_logger().error, params)
+        time.sleep(0.3)
+        self.clear_planned_path()
+        return ok
+
+    def move_arm_wrist(self, robot, arm_comp, params,
+                       roll: float, pitch: float, yaw: float,
+                       pose_link: str) -> bool:
+        """EEF の向きを base_link 座標系の絶対 RPY で指定。位置は現在値を維持。
+        Yaw → Yaw+Pitch → Yaw+Pitch+Roll の順に Cartesian IK で逐次実行。
+        roll/pitch/yaw はラジアン単位。
+        """
+        with robot.get_planning_scene_monitor().read_only() as scene:
+            rs = scene.current_state
+            rs.update()
+            tf_mat = rs.get_global_link_transform(pose_link)
+        x, y, z = float(tf_mat[0, 3]), float(tf_mat[1, 3]), float(tf_mat[2, 3])
+        self.get_logger().info(
+            f"[wrist] {pose_link} 現在位置: ({x:.3f}, {y:.3f}, {z:.3f})")
+
+        # Yaw → Yaw+Pitch → Yaw+Pitch+Roll の順に逐次実行
+        for step_idx, (r, p, yw, label) in enumerate([
+            (0.0,  0.0,   yaw,   f"Yaw={math.degrees(yaw):.1f}°"),
+            (0.0,  pitch, yaw,   f"+Pitch={math.degrees(pitch):.1f}°"),
+            (roll, pitch, yaw,   f"+Roll={math.degrees(roll):.1f}°"),
+        ]):
+            q = _euler_to_quaternion(math.degrees(r), math.degrees(p), math.degrees(yw))
+            goal = PoseStamped()
+            goal.header.frame_id = "base_link"
+            goal.pose.position.x = x
+            goal.pose.position.y = y
+            goal.pose.position.z = z
+            goal.pose.orientation = q
+
+            self.get_logger().info(f"[wrist] step{step_idx + 1}/3 {label}")
+            arm_comp.set_start_state_to_current_state()
+            arm_comp.set_goal_state(pose_stamped_msg=goal, pose_link=pose_link)
+            ok = _plan_and_execute(robot, arm_comp, self.get_logger().error, params)
+            time.sleep(0.3)
+            self.clear_planned_path()
+            if not ok:
+                self.get_logger().error(f"[wrist] {label} 失敗 — 中断")
+                return False
+
+        return True
 
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
@@ -655,6 +864,8 @@ class SciurusRvizGUI:
         self._rh_cam:  np.ndarray | None     = None
         self._lh_base: np.ndarray | None     = None
         self._rh_base: np.ndarray | None     = None
+        self._lh_cam_all: np.ndarray | None  = None
+        self._rh_cam_all: np.ndarray | None  = None
         self._robot                          = None
         self._process: subprocess.Popen | None = None
         self._vis_win: VisualizationWindow | None = None
@@ -793,14 +1004,48 @@ class SciurusRvizGUI:
         spinrow(f4, "Z オフセット [m] (上+):",   self._z_offset_var, -2.0, 2.0, 0.05, "%.2f")
         add_btn(f4, "↻  再計算・マーカ更新", self._on_recalc, "recalc", color="#4a5a3a")
 
-        # 4. アーム制御
+        # 4. アーム制御（3列: 共通ボタン / 左アーム方向 / 右アーム方向）
         f5 = section("4. アーム制御")
-        add_btn(f5, "▶  両アームを移動",   self._on_move,          "move",       color="#3d5b7a")
-        add_btn(f5, "▶  左アームのみ",     self._on_move_left,     "move_left",  color="#3a547a")
-        add_btn(f5, "▶  右アームのみ",     self._on_move_right,    "move_right", color="#3a547a")
-        add_btn(f5, "○  グリッパ 開",     self._on_gripper_open,  "g_open")
-        add_btn(f5, "●  グリッパ 閉",     self._on_gripper_close, "g_close")
-        add_btn(f5, "⌂  初期姿勢へ",      self._on_home,          "home")
+        f5_inner = tk.Frame(f5, bg=PANEL_BG)
+        f5_inner.pack(fill=tk.BOTH)
+
+        f5_col0 = tk.Frame(f5_inner, bg=PANEL_BG)
+        f5_col0.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
+        f5_col1 = tk.Frame(f5_inner, bg=PANEL_BG)
+        f5_col1.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
+        f5_col2 = tk.Frame(f5_inner, bg=PANEL_BG)
+        f5_col2.pack(side=tk.LEFT, fill=tk.Y)
+
+        # 列0: 共通ボタン
+        add_btn(f5_col0, "▶  両アームを移動",   self._on_move,          "move",       color="#3d5b7a")
+        add_btn(f5_col0, "▶  左アームのみ",     self._on_move_left,     "move_left",  color="#3a547a")
+        add_btn(f5_col0, "▶  右アームのみ",     self._on_move_right,    "move_right", color="#3a547a")
+        add_btn(f5_col0, "○  グリッパ 開",     self._on_gripper_open,  "g_open")
+        add_btn(f5_col0, "●  グリッパ 閉",     self._on_gripper_close, "g_close")
+        add_btn(f5_col0, "⌂  初期姿勢へ",      self._on_home,          "home")
+        add_btn(f5_col0, "⊕  関節マーカ更新",  self._on_joint_markers, "joint_markers", color="#5a4a2a")
+
+        # 列1: 左アーム
+        self._l_yaw_var   = tk.DoubleVar(value=0.0)
+        self._l_pitch_var = tk.DoubleVar(value=0.0)
+        self._l_roll_var  = tk.DoubleVar(value=0.0)
+        tk.Label(f5_col1, text="左アーム (EEF相対回転)", bg=PANEL_BG, fg="#aaffaa",
+                 font=("Helvetica", 8, "bold")).pack(anchor="w")
+        spinrow(f5_col1, "ΔYaw   [deg]:", self._l_yaw_var,   -180, 180, 5.0, "%.0f")
+        spinrow(f5_col1, "ΔPitch [deg]:", self._l_pitch_var, -180, 180, 5.0, "%.0f")
+        spinrow(f5_col1, "ΔRoll  [deg]:", self._l_roll_var,  -180, 180, 5.0, "%.0f")
+        add_btn(f5_col1, "↻  左アーム回転", self._on_rotate_left, "rotate_left", color="#3a5a4a")
+
+        # 列2: 右アーム
+        self._r_yaw_var   = tk.DoubleVar(value=0.0)
+        self._r_pitch_var = tk.DoubleVar(value=0.0)
+        self._r_roll_var  = tk.DoubleVar(value=0.0)
+        tk.Label(f5_col2, text="右アーム (EEF相対回転)", bg=PANEL_BG, fg="#ffaaaa",
+                 font=("Helvetica", 8, "bold")).pack(anchor="w")
+        spinrow(f5_col2, "ΔYaw   [deg]:", self._r_yaw_var,   -180, 180, 5.0, "%.0f")
+        spinrow(f5_col2, "ΔPitch [deg]:", self._r_pitch_var, -180, 180, 5.0, "%.0f")
+        spinrow(f5_col2, "ΔRoll  [deg]:", self._r_roll_var,  -180, 180, 5.0, "%.0f")
+        add_btn(f5_col2, "↻  右アーム回転", self._on_rotate_right, "rotate_right", color="#5a3a4a")
 
         # 把持座標 + ステータス
         fr = section("把持座標 [m]")
@@ -909,13 +1154,16 @@ class SciurusRvizGUI:
             "reselect":    s in (S_CAPTURED, S_SELECTED, S_DONE) and not w,
             "estimate":    s == S_SELECTED and not w,
             "recalc":      s == S_DONE and not w,
-            "move":        s == S_DONE and not w,
-            "log_btn":     True,
-            "move_left":   s == S_DONE and not w,
-            "move_right":  s == S_DONE and not w,
-            "g_open":      can_arm,
-            "g_close":     can_arm,
-            "home":        can_arm,
+            "move":         s == S_DONE and not w,
+            "log_btn":      True,
+            "move_left":    s == S_DONE and not w,
+            "move_right":   s == S_DONE and not w,
+            "rotate_left":  s == S_DONE and not w,
+            "rotate_right": s == S_DONE and not w,
+            "g_open":          can_arm,
+            "g_close":         can_arm,
+            "home":            can_arm,
+            "joint_markers":   can_arm,
         }
         for key, btn in self._btns.items():
             btn.config(state=tk.NORMAL if enabled.get(key, False) else tk.DISABLED)
@@ -954,6 +1202,13 @@ class SciurusRvizGUI:
 
     # ──────────────────────── ボタンハンドラ ───────────────────────────────────
 
+    _MOVEIT_READY_KEYWORDS = (
+        "All requested controllers are active",
+        "You can start planning now!",
+        "MoveGroup action server ready",
+        "Ready to take commands for planning group",
+    )
+
     def _on_launch(self):
         cmd = self.args.launch_cmd
         if not cmd:
@@ -967,8 +1222,12 @@ class SciurusRvizGUI:
                 text=True, bufsize=1,
             )
             def _read():
+                home_triggered = False
                 for line in self._process.stdout:
                     self._log(f"[ROS] {line.rstrip()}")
+                    if not home_triggered and any(kw in line for kw in self._MOVEIT_READY_KEYWORDS):
+                        home_triggered = True
+                        self._log("[起動] MoveIt2 準備完了 — 必要なら [⌂ 初期姿勢へ] を押してください")
             threading.Thread(target=_read, daemon=True).start()
         except Exception as e:
             self._log(f"[起動エラー] {e}")
@@ -1114,9 +1373,31 @@ class SciurusRvizGUI:
         lh_wrist = lh_cam_all[0] if lh_cam_all.ndim == 2 else lh_cam_all
         rh_wrist = rh_cam_all[0] if rh_cam_all.ndim == 2 else rh_cam_all
         self._lh_cam, self._rh_cam = lh_wrist, rh_wrist
+        self._lh_cam_all = lh_cam_all if lh_cam_all.ndim == 2 else None
+        self._rh_cam_all = rh_cam_all if rh_cam_all.ndim == 2 else None
         self._log(f"  左手首(cam): {lh_wrist}")
         self._log(f"  右手首(cam): {rh_wrist}")
-        self._log("[Step 4] TF2 変換: camera → base_link")
+
+        # ── パームフレーム → グリッパ回転角 ─────────────────────────────────
+        self._log("[Step 4] パームフレームからグリッパ角を計算")
+        l_euler = r_euler = None
+        try:
+            if self._lh_cam_all is not None and self._lh_cam_all.shape[0] >= 15:
+                l_euler = _palm_to_gripper_euler(self._lh_cam_all, flip_z=False)
+                self._log(
+                    f"  左グリッパ角(base): yaw={l_euler[0]:.1f}°"
+                    f"  pitch={l_euler[1]:.1f}°  roll={l_euler[2]:.1f}°"
+                )
+            if self._rh_cam_all is not None and self._rh_cam_all.shape[0] >= 15:
+                r_euler = _palm_to_gripper_euler(self._rh_cam_all, flip_z=True)
+                self._log(
+                    f"  右グリッパ角(base): yaw={r_euler[0]:.1f}°"
+                    f"  pitch={r_euler[1]:.1f}°  roll={r_euler[2]:.1f}°"
+                )
+        except Exception as e:
+            self._log(f"  [警告] グリッパ角計算失敗: {e}")
+
+        self._log("[Step 5] TF2 変換: camera → base_link")
         x_off = self._x_offset_var.get()
         y_off = self._y_offset_var.get()
         z_off = self._z_offset_var.get()
@@ -1131,12 +1412,24 @@ class SciurusRvizGUI:
         self._log(f"  左手首(base): [{lh_base[0]:.3f}, {lh_base[1]:.3f}, {lh_base[2]:.3f}]")
         self._log(f"  右手首(base): [{rh_base[0]:.3f}, {rh_base[1]:.3f}, {rh_base[2]:.3f}]")
         self.node.publish_grasp_markers(lh_base, rh_base)
+        if self._robot is not None:
+            self.node.publish_joint_markers(self._robot)
+
+        _le, _re = l_euler, r_euler
 
         def _upd():
             self._lbl_lh.config(
                 text=f"左手首: [{lh_base[0]:.3f}, {lh_base[1]:.3f}, {lh_base[2]:.3f}]")
             self._lbl_rh.config(
                 text=f"右手首: [{rh_base[0]:.3f}, {rh_base[1]:.3f}, {rh_base[2]:.3f}]")
+            if _le is not None:
+                self._l_yaw_var.set(round(_le[0], 1))
+                self._l_pitch_var.set(round(_le[1], 1))
+                self._l_roll_var.set(round(_le[2], 1))
+            if _re is not None:
+                self._r_yaw_var.set(round(_re[0], 1))
+                self._r_pitch_var.set(round(_re[1], 1))
+                self._r_roll_var.set(round(_re[2], 1))
             self._set_state(S_DONE)
         self.root.after(0, _upd)
 
@@ -1168,44 +1461,29 @@ class SciurusRvizGUI:
         l_arm  = robot.get_planning_component(self.args.l_arm_group)
         r_arm  = robot.get_planning_component(self.args.r_arm_group)
         plan_p = self._make_plan_params(robot, vel=0.1)
-        q_l = Quaternion(x=-0.707, y=0.0, z=0.0, w=0.707)
-        q_r = Quaternion(x=0.707,  y=0.0, z=0.0, w=0.707)
 
-        Z = self.args.pre_grasp_z_offset
-        lh_pre = self._lh_base.copy(); lh_pre[2] += Z
-        rh_pre = self._rh_base.copy(); rh_pre[2] += Z
-        self._log(f"[移動] プリグラスプへ (z+{Z:.2f}m)...")
-        self.node.move_arm(robot, l_arm, plan_p, lh_pre, self.args.l_pose_link, q_l)
-        self.node.move_arm(robot, r_arm, plan_p, rh_pre, self.args.r_pose_link, q_r)
-
-        self._log("[移動] グラスプ位置へ下降...")
-        self.node.move_arm(robot, l_arm, plan_p, self._lh_base, self.args.l_pose_link, q_l)
-        self.node.move_arm(robot, r_arm, plan_p, self._rh_base, self.args.r_pose_link, q_r)
+        self._log("[移動] グラスプ位置へ移動中 (現在の向きを維持)...")
+        self.node.move_arm(robot, l_arm, plan_p, self._lh_base, self.args.l_pose_link)
+        self.node.move_arm(robot, r_arm, plan_p, self._rh_base, self.args.r_pose_link)
         self._log("[移動完了] RViz で動作を確認してください")
+        self.node.publish_joint_markers(robot)
         self.root.after(0, lambda: self._set_state(S_DONE))
 
     def _move_single_arm(self, robot, side: str):
         if side == "left":
-            arm_group   = self.args.l_arm_group
-            pose_link   = self.args.l_pose_link
-            orientation = Quaternion(x=-0.707, y=0.0, z=0.0, w=0.707)
-            wrist_base  = self._lh_base
+            arm_group  = self.args.l_arm_group
+            pose_link  = self.args.l_pose_link
+            wrist_base = self._lh_base
         else:
-            arm_group   = self.args.r_arm_group
-            pose_link   = self.args.r_pose_link
-            orientation = Quaternion(x=0.707, y=0.0, z=0.0, w=0.707)
-            wrist_base  = self._rh_base
+            arm_group  = self.args.r_arm_group
+            pose_link  = self.args.r_pose_link
+            wrist_base = self._rh_base
 
         plan_p = self._make_plan_params(robot, vel=0.1)
         arm    = robot.get_planning_component(arm_group)
 
-        Z = self.args.pre_grasp_z_offset
-        pre = wrist_base.copy(); pre[2] += Z
-        self._log(f"[{side}アーム] プリグラスプへ移動 (z+{Z:.2f}m)...")
-        self.node.move_arm(robot, arm, plan_p, pre, pose_link, orientation)
-
-        self._log(f"[{side}アーム] グラスプ位置へ下降...")
-        self.node.move_arm(robot, arm, plan_p, wrist_base, pose_link, orientation)
+        self._log(f"[{side}アーム] グラスプ位置へ移動中 (現在の向きを維持)...")
+        self.node.move_arm(robot, arm, plan_p, wrist_base, pose_link)
         self._log(f"[{side}アーム完了]")
 
     def _do_move_left(self):
@@ -1214,6 +1492,45 @@ class SciurusRvizGUI:
 
     def _do_move_right(self):
         self._move_single_arm(self._get_robot(), "right")
+        self.root.after(0, lambda: self._set_state(S_DONE))
+
+    def _on_rotate_left(self):
+        if self._lh_base is None:
+            self._log("[エラー] 左手把持座標が生成されていません")
+            return
+        self._set_state(S_MOVING)
+        self._run_bg(self._do_rotate_arm, "left", on_error_state=S_DONE)
+
+    def _on_rotate_right(self):
+        if self._rh_base is None:
+            self._log("[エラー] 右手把持座標が生成されていません")
+            return
+        self._set_state(S_MOVING)
+        self._run_bg(self._do_rotate_arm, "right", on_error_state=S_DONE)
+
+    def _do_rotate_arm(self, side: str):
+        """EEF の向きを base_link 絶対 RPY で指定。Yaw→Pitch→Roll の順に実行。"""
+        robot = self._get_robot()
+        plan_p = self._make_plan_params(robot, vel=0.1)
+        if side == "left":
+            arm_group = self.args.l_arm_group
+            pose_link = self.args.l_pose_link
+            roll  = self._l_roll_var.get()
+            pitch = self._l_pitch_var.get()
+            yaw   = self._l_yaw_var.get()
+        else:
+            arm_group = self.args.r_arm_group
+            pose_link = self.args.r_pose_link
+            roll  = self._r_roll_var.get()
+            pitch = self._r_pitch_var.get()
+            yaw   = self._r_yaw_var.get()
+
+        arm = robot.get_planning_component(arm_group)
+        self._log(f"[{side}アーム回転] R={roll:.0f}° P={pitch:.0f}° Y={yaw:.0f}° (base_link絶対角, Yaw→Pitch→Roll)")
+        self.node.move_arm_wrist(robot, arm, plan_p,
+                                 math.radians(roll), math.radians(pitch), math.radians(yaw),
+                                 pose_link)
+        self._log(f"[{side}アーム回転完了]")
         self.root.after(0, lambda: self._set_state(S_DONE))
 
     # ──────────────────────── グリッパ / 初期姿勢 ──────────────────────────────
@@ -1274,6 +1591,13 @@ class SciurusRvizGUI:
     def _on_home(self):
         self._run_bg(self._do_home)
 
+    def _on_joint_markers(self):
+        robot = self._robot
+        if robot is None:
+            self._log("[エラー] MoveItPy 未初期化 — 起動ボタンを押してください")
+            return
+        self._run_bg(lambda: self.node.publish_joint_markers(robot))
+
     def _do_home(self):
         if not _MOVEIT_OK:
             self._log("[初期姿勢] MoveItPy 未利用可能")
@@ -1288,14 +1612,16 @@ class SciurusRvizGUI:
             arm.set_start_state_to_current_state()
             arm.set_goal_state(configuration_name=name)
             _plan_and_execute(robot, arm, self._log, plan_p)
+            time.sleep(0.5)
+            self.node.clear_planned_path()
         self._log("初期姿勢完了")
+        self.node.publish_joint_markers(robot)
 
     # ──────────────────────── MoveItPy ヘルパー ────────────────────────────────
 
     def _get_robot(self):
         if not _MOVEIT_OK:
             raise RuntimeError("MoveItPy が利用できません (ROS2 環境を確認してください)")
-        first_init = self._robot is None
         if self._robot is None:
             self._log("MoveItPy 初期化中 (数秒かかります)...")
             from ament_index_python.packages import get_package_share_directory
@@ -1307,26 +1633,17 @@ class SciurusRvizGUI:
             cfg = (
                 MoveItConfigsBuilder("sciurus17")
                 .planning_scene_monitor(
-                    publish_robot_description=True,
-                    publish_robot_description_semantic=True,
+                    publish_robot_description=False,
+                    publish_robot_description_semantic=False,
                 )
                 .moveit_cpp(file_path=moveit_py_yaml)
                 .to_moveit_configs()
             )
+            config_dict = cfg.to_dict()
+            _remove_display_motion_path(config_dict)
             self._robot = MoveItPy(node_name="sciurus17_rviz_moveit",
-                                   config_dict=cfg.to_dict())
+                                   config_dict=config_dict)
             self._log("MoveItPy 初期化完了")
-        if first_init:
-            self._log("[自動] 起動後 初期姿勢へ移動中 (l_arm_init_pose / r_arm_init_pose)...")
-            plan_p = self._make_plan_params(self._robot, vel=0.3)
-            for arm, name in (
-                (self._robot.get_planning_component(self.args.l_arm_group), "l_arm_init_pose"),
-                (self._robot.get_planning_component(self.args.r_arm_group), "r_arm_init_pose"),
-            ):
-                arm.set_start_state_to_current_state()
-                arm.set_goal_state(configuration_name=name)
-                _plan_and_execute(self._robot, arm, self._log, plan_p)
-            self._log("[自動] 初期姿勢完了")
         return self._robot
 
     @staticmethod
@@ -1334,6 +1651,7 @@ class SciurusRvizGUI:
         p = PlanRequestParameters(robot, "ompl_rrtc_default")
         p.max_velocity_scaling_factor     = vel
         p.max_acceleration_scaling_factor = vel
+        p.planning_time                   = 10.0
         return p
 
     # ──────────────────────── 終了処理 ─────────────────────────────────────────
