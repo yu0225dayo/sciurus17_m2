@@ -5,10 +5,16 @@ GraspGenerator (Shape2Gesture) を HTTP サービスとして提供する。
 SAM-6D サーバ (server.py) と独立して動作する。
 
 起動方法:
-    python server_grasp.py \
-        --grasp-model-dir /path/to/save_model \
-        --grasp-client-dir /path/to/client \
-        --host 0.0.0.0 --port 8082
+python server_grasp.py \
+  --sam6d-service http://localhost:8081 \
+  --host 0.0.0.0 \
+  --port 8082
+
+# デフォルト値はすべて server/ ディレクトリ内で解決される:
+#   client/save_model   … server/client -> ../client (symlink)
+#   sam2_checkpoints/   … server/sam2_checkpoints/ (コピー)
+#   sam-3d-objects/     … server/sam-3d-objects/ (既存)
+
 
 エンドポイント:
     GET  /health          — 死活確認
@@ -16,6 +22,8 @@ SAM-6D サーバ (server.py) と独立して動作する。
 """
 
 import argparse
+import csv
+from datetime import datetime
 import io
 import inspect
 import json
@@ -26,7 +34,7 @@ import threading
 
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 import uvicorn
 
 _SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -38,10 +46,159 @@ _grasp_client_dir: str = ""
 _grasp_generator = None
 _grasp_generator_lock = threading.Lock()
 _pipeline_server = None
+_csv_log_path: str = ""
+_csv_lock = threading.Lock()
 
 # /reconstruct_mesh が返す Docker パス → ホストパスのマッピング (server.py と共有 tmp)
 _host_tmp: str   = os.path.join(_SERVER_DIR, "tmp")
 _docker_tmp: str = "/workspace/tmp"
+
+
+def _write_grasp_csv(mesh_path: str, grasps: list) -> str:
+    """把持姿勢を CSV ファイルに追記し、今回分の CSV 文字列を返す"""
+    fieldnames = ["timestamp", "mesh_path", "sample_idx", "hand"] + [
+        f"j{i}_{ax}" for i in range(23) for ax in ("x", "y", "z")
+    ]
+    ts = datetime.now().isoformat(timespec="seconds")
+
+    rows = []
+    for idx, g in enumerate(grasps):
+        for hand_name, joints in (("left", g["left_hand"]), ("right", g["right_hand"])):
+            row = {"timestamp": ts, "mesh_path": mesh_path, "sample_idx": idx, "hand": hand_name}
+            for i, (x, y, z) in enumerate(joints):
+                row[f"j{i}_x"] = x
+                row[f"j{i}_y"] = y
+                row[f"j{i}_z"] = z
+            rows.append(row)
+
+    # CSV 文字列を生成 (レスポンス用)
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+    csv_text = buf.getvalue()
+
+    # ファイルにも追記
+    if _csv_log_path:
+        os.makedirs(os.path.dirname(_csv_log_path), exist_ok=True)
+        file_exists = os.path.exists(_csv_log_path)
+        with _csv_lock:
+            with open(_csv_log_path, "a", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                if not file_exists:
+                    w.writeheader()
+                w.writerows(rows)
+
+    return csv_text
+
+
+# 23-joint hand index constants (from Shape2Gesture visualization.py handinf)
+# Thumb:  0→1→2→3→4→18   (j1=CMC, j18=TIP)
+# Index:  0→5→6→7→19      (j5=MCP, j19=TIP)
+# Middle: 0→8→9→10→20     (j8=MCP, j20=TIP)
+# Ring:   0→11→12→13→21   (j11=MCP, j21=TIP)
+# Pinky:  0→14→15→16→17→22 (j14=MCP, j22=TIP)
+_J_WRIST      = 0
+_J_THUMB_CMC  = 1   # 親指根元
+_J_INDEX_MCP  = 5   # 人差し指付け根
+_J_MIDDLE_MCP = 8   # 中指付け根
+_J_PINKY_MCP  = 14  # 小指付け根
+
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4), (4, 18),   # thumb
+    (0, 5), (5, 6), (6, 7), (7, 19),             # index
+    (0, 8), (8, 9), (9, 10), (10, 20),           # middle
+    (0, 11), (11, 12), (12, 13), (13, 21),       # ring
+    (0, 14), (14, 15), (15, 16), (16, 17), (17, 22),  # pinky
+]
+
+
+def _compute_palm_frame_core(joints: np.ndarray, flip_z: bool):
+    """
+    23-joint 手姿勢から手の平基準座標系を計算する内部ヘルパー。
+
+    基準座標系:
+      X軸: 手首(j0) → 中指MCP(j8) を手の平平面に射影・正規化
+      Z軸: cross(j0→j5, j0→j14) を正規化。flip_z=True のとき符号反転
+           左手: flip_z=False, 右手: flip_z=True
+           (右手では外積が手のひら側を向くため反転して手の甲=+Z に揃える)
+      Y軸: Z × X (右手系)
+      原点: 手首 j0
+
+    Args:
+        joints: (23, 3) 関節座標配列
+        flip_z: True のとき Z軸を反転 (右手用)
+
+    Returns:
+        R:     (3, 3) 回転行列。各列が [x_axis, y_axis, z_axis]
+               物体座標 p を手の平基準系へ変換: p_palm = R.T @ (p - wrist)
+        wrist: (3,) 手首座標 (j0)
+        axes:  dict {"x", "y", "z"} — 各軸の単位ベクトル (物体座標系)
+    """
+    joints = np.asarray(joints, dtype=np.float64)
+
+    wrist      = joints[_J_WRIST]
+    index_mcp  = joints[_J_INDEX_MCP]
+    middle_mcp = joints[_J_MIDDLE_MCP]
+    pinky_mcp  = joints[_J_PINKY_MCP]
+
+    v_index  = index_mcp  - wrist
+    v_pinky  = pinky_mcp  - wrist
+    v_middle = middle_mcp - wrist
+
+    # Z軸: cross(j0→j5, j0→j14) → j5, j14 が XY 平面に乗る
+    z_raw = np.cross(v_index, v_pinky)
+    norm_z = np.linalg.norm(z_raw)
+    if norm_z < 1e-9:
+        raise ValueError("手の平法線が計算できません (3点が直線上)")
+    z_axis = z_raw / norm_z
+    if flip_z:
+        z_axis = -z_axis
+
+    # X軸: 中指方向を手の平平面に射影 (Gram–Schmidt)
+    norm_m = np.linalg.norm(v_middle)
+    if norm_m < 1e-9:
+        raise ValueError("wrist と middle_mcp が同一座標です")
+    x_raw  = v_middle / norm_m
+    x_axis = x_raw - np.dot(x_raw, z_axis) * z_axis
+    norm_x = np.linalg.norm(x_axis)
+    if norm_x < 1e-9:
+        raise ValueError("中指方向が手の平法線と平行です")
+    x_axis /= norm_x
+
+    # Y軸: 右手系
+    y_axis = np.cross(z_axis, x_axis)
+
+    R = np.column_stack([x_axis, y_axis, z_axis])
+    return R, wrist, {"x": x_axis, "y": y_axis, "z": z_axis}
+
+
+def compute_palm_frame_right(joints: np.ndarray):
+    """
+    右手の23-joint姿勢から手の平基準座標系を求める。
+
+    右手では cross(j0→j5, j0→j14) が手のひら側を向くため flip_z=True で反転。
+
+    Returns:
+        R:     (3, 3) 回転行列 (列 = [x, y, z])
+        wrist: (3,) 手首座標
+        axes:  dict {"x", "y", "z"}
+    """
+    return _compute_palm_frame_core(joints, flip_z=True)
+
+
+def compute_palm_frame_left(joints: np.ndarray):
+    """
+    左手の23-joint姿勢から手の平基準座標系を求める。
+
+    左手では cross(j0→j5, j0→j14) がそのまま手の甲方向を向く。
+
+    Returns:
+        R:     (3, 3) 回転行列 (列 = [x, y, z])
+        wrist: (3,) 手首座標
+        axes:  dict {"x", "y", "z"}
+    """
+    return _compute_palm_frame_core(joints, flip_z=False)
 
 
 def _rel(path: str) -> str:
@@ -193,49 +350,87 @@ async def generate_grasp(
     if not os.path.exists(mesh_host):
         raise HTTPException(404, f"メッシュが見つかりません: {mesh_host}")
 
+    # pose_estimate が生成した Z軸スケール済みメッシュがあれば優先して使用
+    scaled_host = mesh_host.replace(".ply", "_scaled.ply")
+    load_path = scaled_host if os.path.exists(scaled_host) else mesh_host
+
     # PLY 点群読み込み (open3d があれば使用、なければ plyfile)
     try:
         import open3d as o3d
-        pcd = o3d.io.read_point_cloud(mesh_host)
+        pcd = o3d.io.read_point_cloud(load_path)
         mesh_pts = np.asarray(pcd.points, dtype=np.float32)
         if len(mesh_pts) == 0:
             raise ValueError("open3d で点群が空")
     except Exception:
         from plyfile import PlyData
-        ply_data = PlyData.read(mesh_host)
+        ply_data = PlyData.read(load_path)
         v = ply_data["vertex"]
         mesh_pts = np.stack([v["x"], v["y"], v["z"]], axis=-1).astype(np.float32)
 
     if len(mesh_pts) == 0:
         raise HTTPException(500, "点群が空です")
 
-    print(f"[GraspServer] PLY 読み込み: {len(mesh_pts)} pts ({_rel(mesh_host)})")
+    print(f"[GraspServer] PLY 読み込み: {len(mesh_pts)} pts ({_rel(load_path)})")
 
-    # 重力アライメント
-    gvec = np.array([gravity_x, gravity_y, gravity_z], dtype=np.float32)
-    gravity_cam = gvec if float(np.linalg.norm(gvec)) > 1e-6 else None
-    mesh_pts_aligned, R_corr = _align_from_gravity(mesh_pts, gravity_cam)
+    # 把持姿勢生成入力: Z軸反転 (server.pyのZ列反転と一致させる)
+    R_corr = np.diag([1.0, 1.0, -1.0]).astype(np.float64)
+    mesh_pts_aligned = (R_corr @ mesh_pts.T).T.astype(mesh_pts.dtype)
 
-    # メッシュスケール: mm 単位の点群 → 高さ (Y軸方向の全幅) [m]
-    # _align_from_gravity により gravity → -Y に揃っているので Y軸 = 鉛直方向
-    height_mm = float(mesh_pts_aligned[:, 1].max() - mesh_pts_aligned[:, 1].min())
-    mesh_scale_m = height_mm / 1000.0
+    # メッシュスケール: Z軸長（高さ）[m]
+    bbox_ext = mesh_pts_aligned.max(axis=0) - mesh_pts_aligned.min(axis=0)
+    mesh_scale_m = float(bbox_ext[2]) / 1000.0
 
     # 把持姿勢生成
-    print(f"[GraspServer] 生成中 (num_samples={num_samples}, scale={mesh_scale_m:.4f} m)...")
+    print(f"[GraspServer] 生成中 (num_samples={num_samples}, scale={mesh_scale_m:.4f} m, "
+          f"scaled={'yes' if load_path == scaled_host else 'no'})...")
     results = gen.generate(mesh_pts_aligned, num_samples=num_samples)
 
-    grasps = [
-        {"left_hand": lh.tolist(), "right_hand": rh.tolist()}
-        for lh, rh in results
-    ]
+    grasps = []
+    for lh, rh in results:
+        entry = {"left_hand": lh.tolist(), "right_hand": rh.tolist()}
+
+        # 手の平基準座標系 (palm frame) を各手に付加
+        for key, joints_np, frame_fn in (
+            ("left_hand",  lh, compute_palm_frame_left),
+            ("right_hand", rh, compute_palm_frame_right),
+        ):
+            try:
+                R_palm, wrist_pos, axes = frame_fn(joints_np)
+                entry[key.replace("_hand", "_palm_frame")] = {
+                    "R":      R_palm.tolist(),      # 3×3: 列が [x_axis, y_axis, z_axis]
+                    "wrist":  wrist_pos.tolist(),
+                    "x_axis": axes["x"].tolist(),   # 手首→親指方向
+                    "y_axis": axes["y"].tolist(),
+                    "z_axis": axes["z"].tolist(),   # 手の甲方向 (左右共通)
+                }
+            except Exception as e:
+                entry[key.replace("_hand", "_palm_frame")] = {"error": str(e)}
+
+        grasps.append(entry)
+
     print(f"[GraspServer] 完了: {len(grasps)} grasps")
+    csv_text = _write_grasp_csv(load_path, grasps)
+    if _csv_log_path:
+        print(f"[GraspServer] CSV 追記: {_csv_log_path}")
 
     return JSONResponse({
         "grasps":       grasps,
         "mesh_scale_m": mesh_scale_m,
         "R_corr":       R_corr.tolist(),
+        "grasps_csv":   csv_text,
     })
+
+
+@app.get("/download_grasps_csv")
+async def download_grasps_csv():
+    """蓄積した把持姿勢 CSV をダウンロードする"""
+    if not _csv_log_path or not os.path.exists(_csv_log_path):
+        raise HTTPException(404, "grasps.csv がまだ存在しません。先に /generate_grasp を実行してください。")
+    return FileResponse(
+        _csv_log_path,
+        media_type="text/csv",
+        filename="grasps.csv",
+    )
 
 
 @app.post("/estimate_and_generate_grasp")
@@ -329,34 +524,41 @@ async def estimate_and_generate_grasp(
         "grasps": grasp["grasps"],
         "mesh_scale_m": grasp["mesh_scale_m"],
         "R_corr": grasp["R_corr"],
+        "grasps_csv": grasp.get("grasps_csv", ""),
     })
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--grasp-model-dir",
-                        default=os.path.join(os.path.dirname(_SERVER_DIR), "client", "save_model"),
+                        default=os.path.join(_SERVER_DIR, "client", "save_model"),
                         help="Shape2Gesture の save_model ディレクトリ")
     parser.add_argument("--grasp-client-dir",
-                        default=os.path.join(os.path.dirname(_SERVER_DIR), "client"),
+                        default=os.path.join(_SERVER_DIR, "client"),
                         help="client/ ディレクトリ (pipeline/models のインポート元)")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8082)
     parser.add_argument("--host-tmp", default=os.path.join(_SERVER_DIR, "tmp"))
     parser.add_argument("--docker-tmp", default="/workspace/tmp")
-    parser.add_argument("--sam-checkpoint", default="",
+    parser.add_argument("--sam-checkpoint",
+                        default=os.path.join(_SERVER_DIR, "sam2_checkpoints", "sam2.1_hiera_large.pt"),
                         help="SAM2 checkpoint. Required for /estimate_and_generate_grasp.")
-    parser.add_argument("--sam3d-config", default="",
+    parser.add_argument("--sam3d-config",
+                        default=os.path.join(_SERVER_DIR, "sam-3d-objects", "checkpoints", "hf", "pipeline.yaml"),
                         help="sam-3d-objects pipeline.yaml. Required for /estimate_and_generate_grasp.")
-    parser.add_argument("--sam3d-repo", default="",
+    parser.add_argument("--sam3d-repo",
+                        default=os.path.join(_SERVER_DIR, "sam-3d-objects"),
                         help="sam-3d-objects repo path. Required for /estimate_and_generate_grasp.")
     parser.add_argument("--sam6d-service", default="http://localhost:8081",
                         help="SAM-6D service URL used by the imported pipeline server.")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--csv-log", default=os.path.join(_SERVER_DIR, "tmp", "grasps.csv"),
+                        help="把持姿勢を追記するCSVファイルパス (省略時は server/tmp/grasps.csv)")
     args = parser.parse_args()
 
     _grasp_model_dir = args.grasp_model_dir
     _grasp_client_dir = args.grasp_client_dir
+    _csv_log_path = args.csv_log
     _host_tmp   = args.host_tmp
     _docker_tmp = args.docker_tmp
 

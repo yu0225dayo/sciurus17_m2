@@ -41,6 +41,7 @@ from tkinter import messagebox, scrolledtext, ttk
 
 import cv2
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 try:
     from PIL import Image, ImageTk
@@ -106,9 +107,25 @@ CANVAS_W = 640
 CANVAS_H = 360
 LIVE_MS  = 50
 
-# グリッパ鉛直下向き初期位置 (base_link [m])
-_HOME_L = np.array([0.30,  0.15, 0.00])
-_HOME_R = np.array([0.30, -0.15, 0.00])
+# 初期位置: 肘曲げ・+X 前方・肩高さ (base_link [m])
+_HOME_L = np.array([0.35,  0.15, 0.30])
+_HOME_R = np.array([0.35, -0.15, 0.30])
+
+# カメラ光学座標系 (x=右, y=下, z=奥) → base_link (x=前, y=左, z=上)
+_R_CAM_OPT_TO_BASE = np.array([
+    [ 0,  0,  1],
+    [-1,  0,  0],
+    [ 0, -1,  0],
+], dtype=np.float64)
+
+# 初期姿勢 EEF 回転行列 (base_link)
+_R_HOME_L = np.array([[0, 1, 0], [0, 0, 1], [1, 0, 0]], dtype=np.float64)
+_R_HOME_R = np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]], dtype=np.float64)
+
+_J_G_WRIST      = 0
+_J_G_INDEX_MCP  = 5
+_J_G_MIDDLE_MCP = 8
+_J_G_PINKY_MCP  = 14
 
 S_IDLE        = "idle"
 S_CAMERA      = "camera"
@@ -177,6 +194,34 @@ def _align_from_gravity(pts: np.ndarray,
             R = np.eye(3) + vx + vx @ vx * (0.1 - c) / (s ** 2)
     R = np.asarray(R, dtype=np.float64)
     return (R @ pts.T).T.astype(pts.dtype), R
+
+
+def _compute_palm_frame(joints: np.ndarray, flip_z: bool) -> np.ndarray:
+    """23関節座標からパームフレーム回転行列 R (3x3, カメラ座標系) を返す。
+    左手: flip_z=False  右手: flip_z=True
+    """
+    wrist  = joints[_J_G_WRIST]
+    v_idx  = joints[_J_G_INDEX_MCP]  - wrist
+    v_pin  = joints[_J_G_PINKY_MCP]  - wrist
+    v_mid  = joints[_J_G_MIDDLE_MCP] - wrist
+    z_axis = np.cross(v_idx, v_pin)
+    z_axis /= np.linalg.norm(z_axis)
+    if flip_z:
+        z_axis = -z_axis
+    x_raw  = v_mid / np.linalg.norm(v_mid)
+    x_axis = x_raw - np.dot(x_raw, z_axis) * z_axis
+    x_axis /= np.linalg.norm(x_axis)
+    y_axis = np.cross(z_axis, x_axis)
+    return np.column_stack([x_axis, y_axis, z_axis])
+
+
+def _palm_to_gripper_euler(joints: np.ndarray, flip_z: bool, r_home: np.ndarray):
+    """カメラ座標系の23関節 → 初期姿勢基準の相対 ZYX Euler角 [deg]"""
+    R_cam  = _compute_palm_frame(joints, flip_z)
+    R_base = _R_CAM_OPT_TO_BASE @ R_cam
+    R_rel  = r_home.T @ R_base
+    yaw, pitch, roll = Rotation.from_matrix(R_rel).as_euler('ZYX', degrees=True)
+    return float(yaw), float(pitch), float(roll)
 
 
 def _project(xyz, intr):
@@ -555,14 +600,25 @@ if _ROS2_OK:
             )
             return np.array([pt_b.point.x, pt_b.point.y, pt_b.point.z])
 
-        def move_arm(self, robot, arm_comp, params, xyz_base, pose_link, orientation):
+        def move_arm(self, robot, arm_comp, params, xyz_base, pose_link,
+                     orientation=None) -> bool:
+            """MoveItPy で目標位置へ移動。orientation 省略時は FK で現在の向きを維持。"""
+            if orientation is None:
+                with robot.get_planning_scene_monitor().read_only() as scene:
+                    rs = scene.current_state
+                    rs.update()
+                    tf_mat = rs.get_global_link_transform(pose_link)
+                rot = Rotation.from_matrix(np.asarray(tf_mat)[:3, :3].astype(np.float64))
+                qx, qy, qz, qw = rot.as_quat()
+            else:
+                qx, qy, qz, qw = orientation.x, orientation.y, orientation.z, orientation.w
             goal = PoseStamped()
             goal.header.frame_id = "base_link"
             goal.pose = Pose(
                 position=Point(x=float(xyz_base[0]),
                                y=float(xyz_base[1]),
                                z=float(xyz_base[2])),
-                orientation=orientation,
+                orientation=Quaternion(x=float(qx), y=float(qy), z=float(qz), w=float(qw)),
             )
             arm_comp.set_start_state_to_current_state()
             arm_comp.set_goal_state(pose_stamped_msg=goal, pose_link=pose_link)
@@ -604,6 +660,129 @@ if _ROS2_OK:
                     return False
 
             return True
+
+        def read_eef_pose(self, robot, pose_link: str):
+            """FK で EEF 位置 (3,) と回転行列 (3,3) を返す。"""
+            with robot.get_planning_scene_monitor().read_only() as scene:
+                rs = scene.current_state
+                rs.update()
+                tf_mat = np.asarray(rs.get_global_link_transform(pose_link))
+            return tf_mat[:3, 3], tf_mat[:3, :3]
+
+        def read_link_direction(self, robot, link6_name: str, pose_link: str):
+            """FK で EEF 位置 (3,) と j6→j7 単位ベクトル (3,) を返す。"""
+            with robot.get_planning_scene_monitor().read_only() as scene:
+                rs = scene.current_state
+                rs.update()
+                tf6 = np.asarray(rs.get_global_link_transform(link6_name))
+                tf7 = np.asarray(rs.get_global_link_transform(pose_link))
+            pos = tf7[:3, 3]
+            vec = tf7[:3, 3] - tf6[:3, 3]
+            norm = np.linalg.norm(vec)
+            vec = vec / norm if norm > 1e-6 else np.array([1.0, 0.0, 0.0])
+            return pos, vec
+
+        def publish_home_direction_markers(self, lh_pos, rh_pos,
+                                           lh_xaxis=None, rh_xaxis=None,
+                                           arrow_len: float = 0.15):
+            """現在の j6→j7 方向矢印 (左:黄, 右:シアン) を配信する。"""
+            _X = np.array([1.0, 0.0, 0.0])
+            lh_xaxis = np.asarray(lh_xaxis, dtype=float) if lh_xaxis is not None else _X
+            rh_xaxis = np.asarray(rh_xaxis, dtype=float) if rh_xaxis is not None else _X
+            arr = MarkerArray()
+            now = self.get_clock().now().to_msg()
+            for mid, wrist, xaxis, color in [
+                (200, lh_pos, lh_xaxis, (1.0, 1.0, 0.0)),
+                (201, rh_pos, rh_xaxis, (0.0, 1.0, 1.0)),
+            ]:
+                tip = wrist + xaxis * arrow_len
+                m = Marker()
+                m.header.frame_id = "base_link"; m.header.stamp = now
+                m.ns = "home_direction"; m.id = mid
+                m.type = Marker.ARROW; m.action = Marker.ADD
+                m.points = [
+                    Point(x=float(wrist[0]), y=float(wrist[1]), z=float(wrist[2])),
+                    Point(x=float(tip[0]),   y=float(tip[1]),   z=float(tip[2])),
+                ]
+                m.scale.x = 0.012; m.scale.y = 0.024; m.scale.z = 0.0
+                r, g, b = color
+                m.color.r = r; m.color.g = g; m.color.b = b; m.color.a = 1.0
+                m.lifetime.sec = 0
+                arr.markers.append(m)
+            self._marker_pub.publish(arr)
+
+        def publish_goal_direction_markers(self, lh_pos, rh_pos,
+                                           lh_xaxis=None, rh_xaxis=None,
+                                           arrow_len: float = 0.15):
+            """ゴール把持方向矢印 (左:オレンジ GL, 右:マゼンタ GR) を配信する。"""
+            _X = np.array([1.0, 0.0, 0.0])
+            lh_xaxis = np.asarray(lh_xaxis, dtype=float) if lh_xaxis is not None else _X
+            rh_xaxis = np.asarray(rh_xaxis, dtype=float) if rh_xaxis is not None else _X
+            arr = MarkerArray()
+            now = self.get_clock().now().to_msg()
+            for mid, wrist, xaxis, color, label in [
+                (202, lh_pos, lh_xaxis, (1.0, 0.5, 0.0), "GL"),
+                (203, rh_pos, rh_xaxis, (1.0, 0.0, 1.0), "GR"),
+            ]:
+                tip = wrist + xaxis * arrow_len
+                m = Marker()
+                m.header.frame_id = "base_link"; m.header.stamp = now
+                m.ns = "goal_direction"; m.id = mid
+                m.type = Marker.ARROW; m.action = Marker.ADD
+                m.points = [
+                    Point(x=float(wrist[0]), y=float(wrist[1]), z=float(wrist[2])),
+                    Point(x=float(tip[0]),   y=float(tip[1]),   z=float(tip[2])),
+                ]
+                m.scale.x = 0.012; m.scale.y = 0.024; m.scale.z = 0.0
+                r, g, b = color
+                m.color.r = r; m.color.g = g; m.color.b = b; m.color.a = 1.0
+                m.lifetime.sec = 0
+                arr.markers.append(m)
+                t = Marker()
+                t.header.frame_id = "base_link"; t.header.stamp = now
+                t.ns = "goal_direction_label"; t.id = mid
+                t.type = Marker.TEXT_VIEW_FACING; t.action = Marker.ADD
+                t.pose.position.x = float(tip[0]) + 0.02
+                t.pose.position.y = float(tip[1])
+                t.pose.position.z = float(tip[2]) + 0.03
+                t.pose.orientation.w = 1.0
+                t.scale.z = 0.03
+                t.color.r = t.color.g = t.color.b = 1.0; t.color.a = 1.0
+                t.text = label; t.lifetime.sec = 0
+                arr.markers.append(t)
+            self._marker_pub.publish(arr)
+
+        def publish_joint_markers(self, robot):
+            """FK で各関節位置を球体+ラベルでマーカ配信する。"""
+            try:
+                with robot.get_planning_scene_monitor().read_only() as scene:
+                    rs = scene.current_state
+                    rs.update()
+                    arr = MarkerArray()
+                    now = self.get_clock().now().to_msg()
+                    mid = 0
+                    for prefix, r_c, g_c, b_c in [("l", 0.1, 0.9, 0.1), ("r", 0.9, 0.5, 0.1)]:
+                        for i in range(1, 8):
+                            link_name = f"{prefix}_link{i}"
+                            try:
+                                tf_mat = rs.get_global_link_transform(link_name)
+                            except Exception:
+                                mid += 1; continue
+                            x, y, z = float(tf_mat[0, 3]), float(tf_mat[1, 3]), float(tf_mat[2, 3])
+                            m = Marker()
+                            m.header.frame_id = "base_link"; m.header.stamp = now
+                            m.ns = "joint_sphere"; m.id = mid
+                            m.type = Marker.SPHERE; m.action = Marker.ADD
+                            m.pose.position.x = x; m.pose.position.y = y; m.pose.position.z = z
+                            m.pose.orientation.w = 1.0
+                            m.scale.x = m.scale.y = m.scale.z = 0.04 if i == 7 else 0.025
+                            m.color.r = r_c; m.color.g = g_c; m.color.b = b_c; m.color.a = 0.85
+                            m.lifetime.sec = 0
+                            arr.markers.append(m)
+                            mid += 1
+                self._marker_pub.publish(arr)
+            except Exception as e:
+                self.get_logger().warn(f"[marker] 関節マーカ失敗: {e}")
 
 
 # ── デモノード (ROS2 不要) ────────────────────────────────────────────────────
@@ -707,9 +886,24 @@ class DemoRobotNode:
         pass  # デモモードでは ROS なし
 
     def publish_hand_keypoints_markers(self, _lh_cam_all, _rh_cam_all, _camera_frame, _base_frame, _xyz_offset=None):
-        pass  # デモモードでは ROS なし
+        pass
 
-    def move_arm(self, robot, arm_comp, params, xyz_base, pose_link, orientation) -> bool:
+    def publish_home_direction_markers(self, lh_pos, rh_pos, lh_xaxis=None, rh_xaxis=None, arrow_len=0.15):
+        pass
+
+    def publish_goal_direction_markers(self, lh_pos, rh_pos, lh_xaxis=None, rh_xaxis=None, arrow_len=0.15):
+        pass
+
+    def publish_joint_markers(self, robot):
+        pass
+
+    def read_eef_pose(self, robot, pose_link: str):
+        return np.array([0.35, 0.15, 0.30]), np.eye(3)
+
+    def read_link_direction(self, robot, link6_name: str, pose_link: str):
+        return np.array([0.35, 0.15, 0.30]), np.array([1.0, 0.0, 0.0])
+
+    def move_arm(self, robot, arm_comp, params, xyz_base, pose_link, orientation=None) -> bool:
         time.sleep(0.5)
         return True
 
@@ -754,6 +948,8 @@ class SciurusGUI:
         self._rh_cam_all: np.ndarray | None = None
         self._lh_base:    np.ndarray | None = None
         self._rh_base:    np.ndarray | None = None
+        self._lh_goal_xaxis: np.ndarray | None = None
+        self._rh_goal_xaxis: np.ndarray | None = None
         self._marker_updating = False
         self._robot                      = None
         self._process: subprocess.Popen | None = None
@@ -897,45 +1093,65 @@ class SciurusGUI:
         add_btn(f4, "→  計算機へ送信・姿勢推定", self._on_estimate, "estimate")
         add_btn(f4, "→  把持姿勢生成",           self._on_grasp,    "grasp")
 
-        # 4. アーム制御
+        # 4. アーム制御（3列: 共通 / 左アーム / 右アーム）
         f5 = section("4. アーム制御")
+        f5_inner = tk.Frame(f5, bg=PANEL_BG)
+        f5_inner.pack(fill=tk.BOTH)
+
+        f5_col0 = tk.Frame(f5_inner, bg=PANEL_BG)
+        f5_col0.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
+        f5_col1 = tk.Frame(f5_inner, bg=PANEL_BG)
+        f5_col1.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
+        f5_col2 = tk.Frame(f5_inner, bg=PANEL_BG)
+        f5_col2.pack(side=tk.LEFT, fill=tk.Y)
+
+        # 列0: 共通ボタン
         self._offset_x_var = tk.DoubleVar(value=0.0)
         self._offset_y_var = tk.DoubleVar(value=0.0)
         self._offset_z_var = tk.DoubleVar(value=0.15)
         for v in (self._offset_x_var, self._offset_y_var, self._offset_z_var):
             v.trace_add("write", lambda *_: self._republish_goal_markers())
-        spinrow(f5, "X offset [m]:", self._offset_x_var, -0.5, 0.5, incr=0.01, fmt="%.2f")
-        spinrow(f5, "Y offset [m]:", self._offset_y_var, -0.5, 0.5, incr=0.01, fmt="%.2f")
-        spinrow(f5, "Z offset [m]:", self._offset_z_var, -0.5, 0.5, incr=0.01, fmt="%.2f")
-        tk.Frame(f5, height=1, bg="#555555").pack(fill=tk.X, pady=4)
-        self._l_yaw_var   = tk.DoubleVar(value=0.0)
-        self._l_pitch_var = tk.DoubleVar(value=0.0)
+        spinrow(f5_col0, "X offset [m]:", self._offset_x_var, -0.5, 0.5, incr=0.01, fmt="%.2f")
+        spinrow(f5_col0, "Y offset [m]:", self._offset_y_var, -0.5, 0.5, incr=0.01, fmt="%.2f")
+        spinrow(f5_col0, "Z offset [m]:", self._offset_z_var, -0.5, 0.5, incr=0.01, fmt="%.2f")
+        tk.Frame(f5_col0, height=1, bg="#555555").pack(fill=tk.X, pady=3)
+        add_btn(f5_col0, "⟳  マーカー更新",      self._republish_goal_markers, "marker_update", color="#4a4a2a")
+        add_btn(f5_col0, "▶  両アームを移動",    self._on_move,              "move",              color="#3d5b7a")
+        add_btn(f5_col0, "▶  左アームのみ",      self._on_move_left,         "move_left",         color="#3a547a")
+        add_btn(f5_col0, "▶  右アームのみ",      self._on_move_right,        "move_right",        color="#3a547a")
+        tk.Frame(f5_col0, height=1, bg="#555555").pack(fill=tk.X, pady=3)
+        add_btn(f5_col0, "⇒  両: 移動+R6→R7回転", self._on_move_align_both,  "move_align_both",   color="#2d5a6a")
+        add_btn(f5_col0, "⇒  左: 移動+R6→R7回転", self._on_move_align_left,  "move_align_left",   color="#2a4a6a")
+        add_btn(f5_col0, "⇒  右: 移動+R6→R7回転", self._on_move_align_right, "move_align_right",  color="#2a4a6a")
+        tk.Frame(f5_col0, height=1, bg="#555555").pack(fill=tk.X, pady=3)
+        add_btn(f5_col0, "○  グリッパ 開",      self._on_gripper_open,  "g_open")
+        add_btn(f5_col0, "●  グリッパ 閉",      self._on_gripper_close, "g_close")
+        add_btn(f5_col0, "⌂  初期姿勢へ (両)",  self._on_home,       "home")
+        add_btn(f5_col0, "⌂  左初期姿勢",       self._on_home_left,  "home_left")
+        add_btn(f5_col0, "⌂  右初期姿勢",       self._on_home_right, "home_right")
+        add_btn(f5_col0, "⊕  関節マーカ更新",   self._on_joint_markers, "joint_markers", color="#5a4a2a")
+
+        # 列1: 左アーム j5/j6/j7
         self._l_roll_var  = tk.DoubleVar(value=0.0)
-        tk.Label(f5, text="左アーム回転 (base_link絶対RPY)",
-                 bg=PANEL_BG, fg="#aaffaa",
+        self._l_pitch_var = tk.DoubleVar(value=0.0)
+        self._l_yaw_var   = tk.DoubleVar(value=0.0)
+        tk.Label(f5_col1, text="左アーム (j5/j6/j7)", bg=PANEL_BG, fg="#aaffaa",
                  font=("Helvetica", 8, "bold")).pack(anchor="w")
-        spinrow(f5, "左 ΔYaw   [deg]:", self._l_yaw_var,   -180, 180, 5.0, "%.0f")
-        spinrow(f5, "左 ΔPitch [deg]:", self._l_pitch_var, -180, 180, 5.0, "%.0f")
-        spinrow(f5, "左 ΔRoll  [deg]:", self._l_roll_var,  -180, 180, 5.0, "%.0f")
-        add_btn(f5, "↻  左アーム回転", self._on_rotate_left, "rotate_left", color="#3a5a4a")
-        self._r_yaw_var   = tk.DoubleVar(value=0.0)
-        self._r_pitch_var = tk.DoubleVar(value=0.0)
+        spinrow(f5_col1, "j5 Roll  [deg]:", self._l_roll_var,  -180, 180, 5.0, "%.0f")
+        spinrow(f5_col1, "j6 Pitch [deg]:", self._l_pitch_var, -180, 180, 5.0, "%.0f")
+        spinrow(f5_col1, "j7 Yaw   [deg]:", self._l_yaw_var,   -180, 180, 5.0, "%.0f")
+        add_btn(f5_col1, "↻  左アーム回転", self._on_rotate_left,  "rotate_left",  color="#3a5a4a")
+
+        # 列2: 右アーム j5/j6/j7
         self._r_roll_var  = tk.DoubleVar(value=0.0)
-        tk.Label(f5, text="右アーム回転 (base_link絶対RPY)",
-                 bg=PANEL_BG, fg="#ffaaaa",
-                 font=("Helvetica", 8, "bold")).pack(anchor="w", pady=(4, 0))
-        spinrow(f5, "右 ΔYaw   [deg]:", self._r_yaw_var,   -180, 180, 5.0, "%.0f")
-        spinrow(f5, "右 ΔPitch [deg]:", self._r_pitch_var, -180, 180, 5.0, "%.0f")
-        spinrow(f5, "右 ΔRoll  [deg]:", self._r_roll_var,  -180, 180, 5.0, "%.0f")
-        add_btn(f5, "↻  右アーム回転", self._on_rotate_right, "rotate_right", color="#5a3a4a")
-        tk.Frame(f5, height=1, bg="#555555").pack(fill=tk.X, pady=4)
-        add_btn(f5, "⟳  マーカー更新",     self._republish_goal_markers, "marker_update", color="#4a4a2a")
-        add_btn(f5, "▶  両アームを移動",   self._on_move,          "move",       color="#3d5b7a")
-        add_btn(f5, "▶  左アームのみ",     self._on_move_left,     "move_left",  color="#3a547a")
-        add_btn(f5, "▶  右アームのみ",     self._on_move_right,    "move_right", color="#3a547a")
-        add_btn(f5, "○  グリッパ 開",     self._on_gripper_open,  "g_open")
-        add_btn(f5, "●  グリッパ 閉",     self._on_gripper_close, "g_close")
-        add_btn(f5, "⌂  初期姿勢へ",      self._on_home,          "home")
+        self._r_pitch_var = tk.DoubleVar(value=0.0)
+        self._r_yaw_var   = tk.DoubleVar(value=0.0)
+        tk.Label(f5_col2, text="右アーム (j5/j6/j7)", bg=PANEL_BG, fg="#ffaaaa",
+                 font=("Helvetica", 8, "bold")).pack(anchor="w")
+        spinrow(f5_col2, "j5 Roll  [deg]:", self._r_roll_var,  -180, 180, 5.0, "%.0f")
+        spinrow(f5_col2, "j6 Pitch [deg]:", self._r_pitch_var, -180, 180, 5.0, "%.0f")
+        spinrow(f5_col2, "j7 Yaw   [deg]:", self._r_yaw_var,   -180, 180, 5.0, "%.0f")
+        add_btn(f5_col2, "↻  右アーム回転", self._on_rotate_right, "rotate_right", color="#5a3a4a")
 
         # 把持座標 + ステータス
         fr = section("把持座標 [m]")
@@ -1054,16 +1270,22 @@ class SciurusGUI:
             "reselect":    s in (S_SELECTED, S_GRASP_READY, S_DONE) and not w,
             "estimate":    s == S_SELECTED and not w,
             "grasp":       s == S_GRASP_READY and not w,
-            "marker_update": s == S_DONE and not w,
-            "move":        s == S_DONE and not w,
-            "move_left":   s == S_DONE and not w,
-            "move_right":  s == S_DONE and not w,
-            "rotate_left":  s == S_DONE and not w,
-            "rotate_right": s == S_DONE and not w,
-            "g_open":      can_arm,
-            "g_close":     can_arm,
-            "home":        can_arm,
-            "log_btn":     True,
+            "marker_update":     s == S_DONE and not w,
+            "move":              s == S_DONE and not w,
+            "move_left":         s == S_DONE and not w,
+            "move_right":        s == S_DONE and not w,
+            "move_align_both":   s == S_DONE and not w,
+            "move_align_left":   s == S_DONE and not w,
+            "move_align_right":  s == S_DONE and not w,
+            "rotate_left":       s == S_DONE and not w,
+            "rotate_right":      s == S_DONE and not w,
+            "joint_markers":     can_arm,
+            "g_open":            can_arm,
+            "g_close":           can_arm,
+            "home":              can_arm,
+            "home_left":         can_arm,
+            "home_right":        can_arm,
+            "log_btn":           True,
         }
         for key, btn in self._btns.items():
             btn.config(state=tk.NORMAL if enabled.get(key, False) else tk.DISABLED)
@@ -1356,6 +1578,18 @@ class SciurusGUI:
         self._rh_cam_all = rh_cam_all if rh_cam_all.ndim == 2 else None
         self._log(f"  左手首(cam): {lh_wrist}")
         self._log(f"  右手首(cam): {rh_wrist}")
+
+        # パームフレーム → グリッパ回転角ログ
+        try:
+            if self._lh_cam_all is not None and self._lh_cam_all.shape[0] >= 15:
+                l_euler = _palm_to_gripper_euler(self._lh_cam_all, flip_z=False, r_home=_R_HOME_L)
+                self._log(f"  左グリッパ角: yaw={l_euler[0]:.1f}° pitch={l_euler[1]:.1f}° roll={l_euler[2]:.1f}°")
+            if self._rh_cam_all is not None and self._rh_cam_all.shape[0] >= 15:
+                r_euler = _palm_to_gripper_euler(self._rh_cam_all, flip_z=True,  r_home=_R_HOME_R)
+                self._log(f"  右グリッパ角: yaw={r_euler[0]:.1f}° pitch={r_euler[1]:.1f}° roll={r_euler[2]:.1f}°")
+        except Exception as e:
+            self._log(f"  [警告] グリッパ角計算失敗: {e}")
+
         self._log("[Step 4] TF2 変換: camera → base_link")
         lh_base = self.node.camera_to_base(lh_wrist, self.args.camera_frame, self.args.base_frame)
         rh_base = self.node.camera_to_base(rh_wrist, self.args.camera_frame, self.args.base_frame)
@@ -1364,11 +1598,41 @@ class SciurusGUI:
         lh_all_s, rh_all_s = lh_cam_all, rh_cam_all
         self.root.after(0, lambda: self._vis_win and self._vis_win.update_grasp(
             rgb_snap, lh_all_s, rh_all_s, intr_snap))
-        self._update_coord_labels(lh_base, rh_base)
         self.node.publish_hand_keypoints_markers(
             self._lh_cam_all, self._rh_cam_all,
             self.args.camera_frame, self.args.base_frame,
         )
+
+        # ゴール中指方向マーカ
+        try:
+            lh_goal_xaxis = rh_goal_xaxis = None
+            if self._lh_cam_all is not None and self._lh_cam_all.shape[0] >= 15:
+                R_lh = _R_CAM_OPT_TO_BASE @ _compute_palm_frame(self._lh_cam_all, flip_z=False)
+                lh_goal_xaxis = R_lh[:, 0]
+            if self._rh_cam_all is not None and self._rh_cam_all.shape[0] >= 15:
+                R_rh = _R_CAM_OPT_TO_BASE @ _compute_palm_frame(self._rh_cam_all, flip_z=True)
+                rh_goal_xaxis = R_rh[:, 0]
+            self._lh_goal_xaxis = lh_goal_xaxis
+            self._rh_goal_xaxis = rh_goal_xaxis
+            self.node.publish_goal_direction_markers(lh_base, rh_base,
+                                                     lh_xaxis=lh_goal_xaxis,
+                                                     rh_xaxis=rh_goal_xaxis)
+        except Exception as e:
+            self._log(f"  [警告] ゴール方向マーカ失敗: {e}")
+
+        if self._robot is not None:
+            self.node.publish_joint_markers(self._robot)
+
+        # j5/j6/j7 逆算
+        l_joints = self._palm_to_wrist_joints(self._lh_cam_all, flip_z=False, pre_j5_link='l_link4')
+        r_joints = self._palm_to_wrist_joints(self._rh_cam_all, flip_z=True,  pre_j5_link='r_link4')
+        if l_joints:
+            self._log(f"  左 j5={l_joints[0]:.1f}° j6={l_joints[1]:.1f}° j7={l_joints[2]:.1f}°")
+        if r_joints:
+            self._log(f"  右 j5={r_joints[0]:.1f}° j6={r_joints[1]:.1f}° j7={r_joints[2]:.1f}°")
+
+        _lj, _rj = l_joints, r_joints
+        self._update_coord_labels(lh_base, rh_base, _lj, _rj)
 
     def _do_grasp_demo(self):
         self._log("[Demo Step 3] Shape2Gesture シミュレーション...")
@@ -1376,6 +1640,45 @@ class SciurusGUI:
         lh_wrist = np.array([self._t[0] - 0.05, self._t[1] + 0.12, self._t[2]])
         rh_wrist = np.array([self._t[0] - 0.05, self._t[1] - 0.12, self._t[2]])
         self._finish_grasp(lh_wrist, rh_wrist)
+
+    def _palm_to_wrist_joints(self, joints_cam, flip_z: bool,
+                               pre_j5_link: str):
+        """カメラ検出の23関節 → j5/j6/j7 絶対角 [deg] を FK 逆算で返す。robot 未初期化時は None。"""
+        if self._robot is None:
+            return None
+        if joints_cam is None or np.asarray(joints_cam).shape[0] < 15:
+            return None
+        try:
+            R_goal = _R_CAM_OPT_TO_BASE @ _compute_palm_frame(joints_cam, flip_z)
+            with self._robot.get_planning_scene_monitor().read_only() as scene:
+                rs = scene.current_state
+                rs.update()
+                tf_mat = np.asarray(rs.get_global_link_transform(pre_j5_link))
+            R_0_to_4 = tf_mat[:3, :3]
+            R_j567 = R_0_to_4.T @ R_goal
+            j5, j6, j7 = Rotation.from_matrix(R_j567).as_euler('YZY')
+
+            if pre_j5_link == 'l_link4':
+                j6_lim = (-math.radians(60),  math.radians(123))
+            else:
+                j6_lim = (-math.radians(123), math.radians(60))
+            j5_lim = (-math.radians(90), math.radians(90))
+            j7_lim = (-math.radians(170), math.radians(170))
+
+            def _in(v, lo, hi): return lo <= v <= hi
+            def _norm(a): return ((a + math.pi) % (2 * math.pi)) - math.pi
+
+            if not (_in(j5, *j5_lim) and _in(j6, *j6_lim) and _in(j7, *j7_lim)):
+                j5a, j6a, j7a = _norm(j5 + math.pi), -j6, _norm(j7 + math.pi)
+                if _in(j5a, *j5_lim) and _in(j6a, *j6_lim) and _in(j7a, *j7_lim):
+                    j5, j6, j7 = j5a, j6a, j7a
+                else:
+                    self._log(f"  [警告] 両YZY解が制限外")
+
+            return math.degrees(j5), math.degrees(j6), math.degrees(j7)
+        except Exception as e:
+            self._log(f"  [警告] j5/j6/j7 逆算失敗: {e}")
+            return None
 
     def _get_wrist_coords(self):
         """Entryフィールドから左右手首座標を読み取る。パース失敗時はNoneを返す。"""
@@ -1414,7 +1717,7 @@ class SciurusGUI:
         finally:
             self._marker_updating = False
 
-    def _update_coord_labels(self, lh_base, rh_base):
+    def _update_coord_labels(self, lh_base, rh_base, l_joints=None, r_joints=None):
         self._log(f"  左手首(base): [{lh_base[0]:.3f}, {lh_base[1]:.3f}, {lh_base[2]:.3f}]")
         self._log(f"  右手首(base): [{rh_base[0]:.3f}, {rh_base[1]:.3f}, {rh_base[2]:.3f}]")
         offset = self._get_offset()
@@ -1422,6 +1725,14 @@ class SciurusGUI:
         def _upd():
             self._lh_coord_var.set(f"{lh_base[0]:.3f}, {lh_base[1]:.3f}, {lh_base[2]:.3f}")
             self._rh_coord_var.set(f"{rh_base[0]:.3f}, {rh_base[1]:.3f}, {rh_base[2]:.3f}")
+            if l_joints is not None:
+                self._l_roll_var.set(round(l_joints[0], 1))
+                self._l_pitch_var.set(round(l_joints[1], 1))
+                self._l_yaw_var.set(round(l_joints[2], 1))
+            if r_joints is not None:
+                self._r_roll_var.set(round(r_joints[0], 1))
+                self._r_pitch_var.set(round(r_joints[1], 1))
+                self._r_yaw_var.set(round(r_joints[2], 1))
             self._set_state(S_DONE)
         self.root.after(0, _upd)
 
@@ -1456,6 +1767,138 @@ class SciurusGUI:
             self._do_move_right_demo if self.args.demo else self._do_move_right,
             on_error_state=S_DONE,
         )
+
+    def _on_move_align_left(self):
+        if self._lh_base is None:
+            self._log("[エラー] 左手把持座標が生成されていません")
+            return
+        self._set_state(S_MOVING)
+        self._run_bg(self._do_move_align_left, on_error_state=S_DONE)
+
+    def _on_move_align_right(self):
+        if self._rh_base is None:
+            self._log("[エラー] 右手把持座標が生成されていません")
+            return
+        self._set_state(S_MOVING)
+        self._run_bg(self._do_move_align_right, on_error_state=S_DONE)
+
+    def _on_move_align_both(self):
+        if self._lh_base is None or self._rh_base is None:
+            self._log("[エラー] 把持座標が生成されていません")
+            return
+        self._set_state(S_MOVING)
+        self._run_bg(self._do_move_align_both, on_error_state=S_DONE)
+
+    def _do_move_align_left(self):
+        self._exec_move_and_align("left")
+        self.root.after(0, lambda: self._set_state(S_DONE))
+
+    def _do_move_align_right(self):
+        self._exec_move_and_align("right")
+        self.root.after(0, lambda: self._set_state(S_DONE))
+
+    def _do_move_align_both(self):
+        self._exec_move_and_align("left")
+        time.sleep(0.3)
+        self._exec_move_and_align("right")
+        self.root.after(0, lambda: self._set_state(S_DONE))
+
+    def _exec_move_and_align(self, side: str):
+        """グラスプ位置へ移動しながら j6→j7 を GL/GR 方向に揃える。"""
+        robot  = self._get_robot()
+        plan_p = self._make_plan_params(robot, vel=0.05)
+
+        if side == "left":
+            arm_group  = self.args.l_arm_group
+            pose_link  = self.args.l_pose_link
+            wrist_base = self._lh_base
+            goal_xaxis = self._lh_goal_xaxis
+            link6_name = "l_link6"
+        else:
+            arm_group  = self.args.r_arm_group
+            pose_link  = self.args.r_pose_link
+            wrist_base = self._rh_base
+            goal_xaxis = self._rh_goal_xaxis
+            link6_name = "r_link6"
+
+        if wrist_base is None or goal_xaxis is None:
+            self._log(f"[{side}移動+回転] 把持座標またはターゲット方向データがありません")
+            return
+
+        with robot.get_planning_scene_monitor().read_only() as scene:
+            rs = scene.current_state
+            rs.update()
+            tf6 = np.asarray(rs.get_global_link_transform(link6_name))
+            tf7 = np.asarray(rs.get_global_link_transform(pose_link))
+
+        vec  = tf7[:3, 3] - tf6[:3, 3]
+        norm = np.linalg.norm(vec)
+        if norm < 1e-6:
+            self._log(f"[{side}移動+回転] j6→j7 ベクトルが零 — スキップ")
+            return
+        j6_to_j7   = vec / norm
+        R7         = tf7[:3, :3]
+        target_dir = np.asarray(goal_xaxis, dtype=np.float64)
+        target_dir = target_dir / np.linalg.norm(target_dir)
+        t_local    = R7.T @ j6_to_j7
+
+        rot_base, _ = Rotation.align_vectors([target_dir], [t_local])
+        R_base      = rot_base.as_matrix()
+
+        dot       = float(np.clip(np.dot(j6_to_j7, target_dir), -1.0, 1.0))
+        angle_deg = math.degrees(math.acos(dot))
+        self._log(
+            f"[{side}移動+回転] j6→j7=({j6_to_j7[0]:+.3f},{j6_to_j7[1]:+.3f},{j6_to_j7[2]:+.3f}) "
+            f"→ GL/GR=({target_dir[0]:+.3f},{target_dir[1]:+.3f},{target_dir[2]:+.3f}) "
+            f"角度差={angle_deg:.1f}° 目標位置: [{wrist_base[0]:.3f},{wrist_base[1]:.3f},{wrist_base[2]:.3f}]"
+        )
+
+        qx, qy, qz, qw = Rotation.from_matrix(R_base).as_quat()
+        orientation = Quaternion(x=float(qx), y=float(qy), z=float(qz), w=float(qw))
+        arm = robot.get_planning_component(arm_group)
+        ok  = self.node.move_arm(robot, arm, plan_p, wrist_base, pose_link, orientation)
+
+        if ok:
+            self._log(f"[{side}移動+回転完了]")
+            self.node.publish_joint_markers(robot)
+            try:
+                lh_pos, lh_dir = self.node.read_link_direction(robot, "l_link6", self.args.l_pose_link)
+                rh_pos, rh_dir = self.node.read_link_direction(robot, "r_link6", self.args.r_pose_link)
+                self.node.publish_home_direction_markers(lh_pos, rh_pos,
+                                                         lh_xaxis=lh_dir, rh_xaxis=rh_dir)
+                if self._lh_goal_xaxis is not None or self._rh_goal_xaxis is not None:
+                    lh_b = self._lh_base if self._lh_base is not None else lh_pos
+                    rh_b = self._rh_base if self._rh_base is not None else rh_pos
+                    self.node.publish_goal_direction_markers(lh_b, rh_b,
+                                                             lh_xaxis=self._lh_goal_xaxis,
+                                                             rh_xaxis=self._rh_goal_xaxis)
+            except Exception as e:
+                self._log(f"[警告] 方向マーカ更新失敗: {e}")
+        else:
+            self._log(f"[{side}移動+回転失敗]")
+
+    def _on_joint_markers(self):
+        if self._robot is None:
+            self._log("[エラー] MoveItPy 未初期化 — 起動ボタンを押してください")
+            return
+        self._run_bg(self._do_joint_markers)
+
+    def _do_joint_markers(self):
+        robot = self._get_robot()
+        self.node.publish_joint_markers(robot)
+        try:
+            lh_pos, lh_dir = self.node.read_link_direction(robot, "l_link6", self.args.l_pose_link)
+            rh_pos, rh_dir = self.node.read_link_direction(robot, "r_link6", self.args.r_pose_link)
+            self.node.publish_home_direction_markers(lh_pos, rh_pos,
+                                                     lh_xaxis=lh_dir, rh_xaxis=rh_dir)
+            if self._lh_goal_xaxis is not None or self._rh_goal_xaxis is not None:
+                lh_b = self._lh_base if self._lh_base is not None else lh_pos
+                rh_b = self._rh_base if self._rh_base is not None else rh_pos
+                self.node.publish_goal_direction_markers(lh_b, rh_b,
+                                                         lh_xaxis=self._lh_goal_xaxis,
+                                                         rh_xaxis=self._rh_goal_xaxis)
+        except Exception as e:
+            self._log(f"[警告] 方向マーカ更新失敗: {e}")
 
     def _on_rotate_left(self):
         self._set_state(S_MOVING)
@@ -1682,6 +2125,20 @@ class SciurusGUI:
         )
         if ok:
             self._log(f"[{side} arm rotation done]")
+            self.node.publish_joint_markers(robot)
+            try:
+                lh_pos, lh_dir = self.node.read_link_direction(robot, "l_link6", self.args.l_pose_link)
+                rh_pos, rh_dir = self.node.read_link_direction(robot, "r_link6", self.args.r_pose_link)
+                self.node.publish_home_direction_markers(lh_pos, rh_pos,
+                                                         lh_xaxis=lh_dir, rh_xaxis=rh_dir)
+                if self._lh_goal_xaxis is not None or self._rh_goal_xaxis is not None:
+                    lh_b = self._lh_base if self._lh_base is not None else lh_pos
+                    rh_b = self._rh_base if self._rh_base is not None else rh_pos
+                    self.node.publish_goal_direction_markers(lh_b, rh_b,
+                                                             lh_xaxis=self._lh_goal_xaxis,
+                                                             rh_xaxis=self._rh_goal_xaxis)
+            except Exception as e:
+                self._log(f"[警告] 方向マーカ更新失敗: {e}")
         else:
             self._log(f"[{side} arm rotation failed]")
         self.root.after(0, lambda: self._set_state(S_DONE))
@@ -1721,28 +2178,71 @@ class SciurusGUI:
     def _on_home(self):
         self._run_bg(self._do_home)
 
+    def _on_home_left(self):
+        self._run_bg(self._do_home_left)
+
+    def _on_home_right(self):
+        self._run_bg(self._do_home_right)
+
+    def _do_home_left(self):
+        if self.args.demo:
+            self._log("[Demo] 左アーム初期姿勢シミュレーション...")
+            time.sleep(0.5)
+            return
+        robot  = self._get_robot()
+        plan_p = self._make_plan_params(robot, vel=0.05)
+        l_arm  = robot.get_planning_component(self.args.l_arm_group)
+        self._log("[初期姿勢] 左アーム → l_arm_init_pose へ移動中...")
+        l_arm.set_start_state_to_current_state()
+        l_arm.set_goal_state(configuration_name="l_arm_init_pose")
+        ok = _plan_and_execute(robot, l_arm, self._log, plan_p)
+        if ok:
+            self._log("[初期姿勢] 左アーム完了")
+        else:
+            self._log("[初期姿勢] 左アーム計画失敗")
+        self.node.publish_joint_markers(robot)
+
+    def _do_home_right(self):
+        if self.args.demo:
+            self._log("[Demo] 右アーム初期姿勢シミュレーション...")
+            time.sleep(0.5)
+            return
+        robot  = self._get_robot()
+        plan_p = self._make_plan_params(robot, vel=0.05)
+        r_arm  = robot.get_planning_component(self.args.r_arm_group)
+        self._log("[初期姿勢] 右アーム → r_arm_init_pose へ移動中...")
+        r_arm.set_start_state_to_current_state()
+        r_arm.set_goal_state(configuration_name="r_arm_init_pose")
+        ok = _plan_and_execute(robot, r_arm, self._log, plan_p)
+        if ok:
+            self._log("[初期姿勢] 右アーム完了")
+        else:
+            self._log("[初期姿勢] 右アーム計画失敗")
+        self.node.publish_joint_markers(robot)
+
     def _do_home(self):
         if self.args.demo:
             self._log("[Demo] 初期姿勢へ移動シミュレーション...")
             time.sleep(1.5)
             self._log("[Demo] 初期姿勢完了")
             return
+        self._do_home_left()
+        time.sleep(0.5)
+        self._do_home_right()
         robot  = self._get_robot()
         plan_p = self._make_plan_params(robot, vel=0.05)
-        self._log("初期姿勢へ移動中 (グリッパ鉛直下向き)...")
-        q_down_l = Quaternion(x=-0.707, y=0.0, z=0.0, w=0.707)
-        q_down_r = Quaternion(x= 0.707, y=0.0, z=0.0, w=0.707)
-        self.node.move_arm(robot,
-                           robot.get_planning_component(self.args.l_arm_group),
-                           plan_p, _HOME_L, self.args.l_pose_link, q_down_l)
-        self.node.move_arm(robot,
-                           robot.get_planning_component(self.args.r_arm_group),
-                           plan_p, _HOME_R, self.args.r_pose_link, q_down_r)
-        waist = robot.get_planning_component("waist_group")
+        waist  = robot.get_planning_component("waist_group")
         waist.set_start_state_to_current_state()
         waist.set_goal_state(configuration_name="waist_init_pose")
         _plan_and_execute(robot, waist, self._log, plan_p)
         self._log("初期姿勢完了")
+        try:
+            lh_pos, lh_dir = self.node.read_link_direction(robot, "l_link6", self.args.l_pose_link)
+            rh_pos, rh_dir = self.node.read_link_direction(robot, "r_link6", self.args.r_pose_link)
+            self.node.publish_home_direction_markers(lh_pos, rh_pos,
+                                                     lh_xaxis=lh_dir, rh_xaxis=rh_dir)
+        except Exception as e:
+            self._log(f"[警告] 方向マーカ更新失敗: {e}")
 
     # ──────────────────────── MoveItPy ヘルパー ────────────────────────────────
 
