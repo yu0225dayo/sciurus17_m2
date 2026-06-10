@@ -106,6 +106,10 @@ CANVAS_W = 640
 CANVAS_H = 360
 LIVE_MS  = 50
 
+# グリッパ鉛直下向き初期位置 (base_link [m])
+_HOME_L = np.array([0.30,  0.15, 0.00])
+_HOME_R = np.array([0.30, -0.15, 0.00])
+
 S_IDLE        = "idle"
 S_CAMERA      = "camera"
 S_CAPTURED    = "captured"
@@ -440,6 +444,66 @@ if _ROS2_OK:
                 arr.markers.append(m)
             self._marker_pub.publish(arr)
 
+        def publish_hand_keypoints_markers(self, lh_cam_all, rh_cam_all, camera_frame, base_frame, xyz_offset=None):
+            """手首(j0)と指先5本(j18-j22)を base_link フレームでマーカ配信する。"""
+            KEYPOINTS = [
+                (18, "thumb",  (1.0, 0.5, 0.0)),
+                (19, "index",  (0.2, 0.4, 1.0)),
+                (20, "middle", (0.9, 0.1, 0.1)),
+                (21, "ring",   (0.1, 0.7, 0.1)),
+                (22, "pinky",  (0.6, 0.1, 0.8)),
+            ]
+            arr = MarkerArray()
+            now = self.get_clock().now().to_msg()
+            mid = 100
+            for hand_prefix, cam_all in [("L", lh_cam_all), ("R", rh_cam_all)]:
+                if cam_all is None or np.asarray(cam_all).ndim != 2 or np.asarray(cam_all).shape[0] < 23:
+                    mid += len(KEYPOINTS) * 2
+                    continue
+                cam_all = np.asarray(cam_all, dtype=np.float64)
+                for joint_idx, kp_label, color in KEYPOINTS:
+                    r, g, b = color
+                    try:
+                        xyz_base = self.camera_to_base(cam_all[joint_idx], camera_frame, base_frame)
+                    except Exception:
+                        mid += 1
+                        continue
+                    if xyz_offset is not None:
+                        xyz_base = xyz_base + xyz_offset
+                    m = Marker()
+                    m.header.frame_id = base_frame
+                    m.header.stamp    = now
+                    m.ns              = "hand_kp_sphere"
+                    m.id              = mid
+                    m.type            = Marker.SPHERE
+                    m.action          = Marker.ADD
+                    m.pose.position.x = float(xyz_base[0])
+                    m.pose.position.y = float(xyz_base[1])
+                    m.pose.position.z = float(xyz_base[2])
+                    m.pose.orientation.w = 1.0
+                    m.scale.x = m.scale.y = m.scale.z = 0.025
+                    m.color.r = r; m.color.g = g; m.color.b = b; m.color.a = 0.9
+                    m.lifetime.sec = 0
+                    arr.markers.append(m)
+                    t = Marker()
+                    t.header.frame_id = base_frame
+                    t.header.stamp    = now
+                    t.ns              = "hand_kp_label"
+                    t.id              = mid
+                    t.type            = Marker.TEXT_VIEW_FACING
+                    t.action          = Marker.ADD
+                    t.pose.position.x = float(xyz_base[0])
+                    t.pose.position.y = float(xyz_base[1])
+                    t.pose.position.z = float(xyz_base[2]) + 0.04
+                    t.pose.orientation.w = 1.0
+                    t.scale.z         = 0.025
+                    t.color.r = t.color.g = t.color.b = 1.0; t.color.a = 1.0
+                    t.text            = f"{hand_prefix}_{kp_label}"
+                    t.lifetime.sec    = 0
+                    arr.markers.append(t)
+                    mid += 1
+            self._marker_pub.publish(arr)
+
         def _color_cb(self, msg):
             try:
                 bgr = self._bridge.imgmsg_to_cv2(msg, "bgr8")
@@ -642,6 +706,9 @@ class DemoRobotNode:
     def publish_goal_markers(self, lh_xyz, rh_xyz, base_frame):
         pass  # デモモードでは ROS なし
 
+    def publish_hand_keypoints_markers(self, _lh_cam_all, _rh_cam_all, _camera_frame, _base_frame, _xyz_offset=None):
+        pass  # デモモードでは ROS なし
+
     def move_arm(self, robot, arm_comp, params, xyz_base, pose_link, orientation) -> bool:
         time.sleep(0.5)
         return True
@@ -681,10 +748,12 @@ class SciurusGUI:
         self._R: np.ndarray | None       = None
         self._t: np.ndarray | None       = None
         self._gravity: np.ndarray | None = None
-        self._lh_cam:  np.ndarray | None = None
-        self._rh_cam:  np.ndarray | None = None
-        self._lh_base: np.ndarray | None = None
-        self._rh_base: np.ndarray | None = None
+        self._lh_cam:     np.ndarray | None = None
+        self._rh_cam:     np.ndarray | None = None
+        self._lh_cam_all: np.ndarray | None = None
+        self._rh_cam_all: np.ndarray | None = None
+        self._lh_base:    np.ndarray | None = None
+        self._rh_base:    np.ndarray | None = None
         self._marker_updating = False
         self._robot                      = None
         self._process: subprocess.Popen | None = None
@@ -1283,6 +1352,8 @@ class SciurusGUI:
         lh_wrist = lh_cam_all[0] if lh_cam_all.ndim == 2 else lh_cam_all
         rh_wrist = rh_cam_all[0] if rh_cam_all.ndim == 2 else rh_cam_all
         self._lh_cam, self._rh_cam = lh_wrist, rh_wrist
+        self._lh_cam_all = lh_cam_all if lh_cam_all.ndim == 2 else None
+        self._rh_cam_all = rh_cam_all if rh_cam_all.ndim == 2 else None
         self._log(f"  左手首(cam): {lh_wrist}")
         self._log(f"  右手首(cam): {rh_wrist}")
         self._log("[Step 4] TF2 変換: camera → base_link")
@@ -1294,6 +1365,10 @@ class SciurusGUI:
         self.root.after(0, lambda: self._vis_win and self._vis_win.update_grasp(
             rgb_snap, lh_all_s, rh_all_s, intr_snap))
         self._update_coord_labels(lh_base, rh_base)
+        self.node.publish_hand_keypoints_markers(
+            self._lh_cam_all, self._rh_cam_all,
+            self.args.camera_frame, self.args.base_frame,
+        )
 
     def _do_grasp_demo(self):
         self._log("[Demo Step 3] Shape2Gesture シミュレーション...")
@@ -1326,6 +1401,11 @@ class SciurusGUI:
             lh = self._lh_base + offset
             rh = self._rh_base + offset
             self.node.publish_goal_markers(lh, rh, self.args.base_frame)
+            self.node.publish_hand_keypoints_markers(
+                self._lh_cam_all, self._rh_cam_all,
+                self.args.camera_frame, self.args.base_frame,
+                offset,
+            )
             self._lh_coord_var.set(f"{lh[0]:.3f}, {lh[1]:.3f}, {lh[2]:.3f}")
             self._rh_coord_var.set(f"{rh[0]:.3f}, {rh[1]:.3f}, {rh[2]:.3f}")
             self._offset_x_var.set(0.0)
@@ -1416,11 +1496,9 @@ class SciurusGUI:
             comp.set_goal_state(robot_state=rs)
             _plan_and_execute(robot, comp, log, g_plan_p)
 
-        log("[Step 5] 初期姿勢へ...")
-        for arm, name in ((l_arm, "l_arm_init_pose"), (r_arm, "r_arm_init_pose")):
-            arm.set_start_state_to_current_state()
-            arm.set_goal_state(configuration_name=name)
-            _plan_and_execute(robot, arm, log, init_plan_p)
+        log("[Step 5] 初期姿勢へ (グリッパ鉛直下向き)...")
+        self.node.move_arm(robot, l_arm, init_plan_p, _HOME_L, self.args.l_pose_link, q_l)
+        self.node.move_arm(robot, r_arm, init_plan_p, _HOME_R, self.args.r_pose_link, q_r)
 
         log("[Step 5] グリッパ開放...")
         set_gripper(l_gripper, "l_gripper_group", OPEN_L)
@@ -1484,10 +1562,9 @@ class SciurusGUI:
             gripper.set_goal_state(robot_state=rs)
             _plan_and_execute(robot, gripper, log, g_plan_p)
 
-        log(f"[{side}アーム] 初期姿勢へ...")
-        arm.set_start_state_to_current_state()
-        arm.set_goal_state(configuration_name=init_pose)
-        _plan_and_execute(robot, arm, log, init_plan_p)
+        home_pos = _HOME_L if side == "left" else _HOME_R
+        log(f"[{side}アーム] 初期姿勢へ (グリッパ鉛直下向き)...")
+        self.node.move_arm(robot, arm, init_plan_p, home_pos, pose_link, orientation)
 
         log(f"[{side}アーム] グリッパ開放...")
         set_gripper(open_angle)
@@ -1652,15 +1729,19 @@ class SciurusGUI:
             return
         robot  = self._get_robot()
         plan_p = self._make_plan_params(robot, vel=0.05)
-        self._log("初期姿勢へ移動中...")
-        for comp, name in (
-            (robot.get_planning_component(self.args.l_arm_group), "l_arm_init_pose"),
-            (robot.get_planning_component(self.args.r_arm_group), "r_arm_init_pose"),
-            (robot.get_planning_component("waist_group"),         "waist_init_pose"),
-        ):
-            comp.set_start_state_to_current_state()
-            comp.set_goal_state(configuration_name=name)
-            _plan_and_execute(robot, comp, self._log, plan_p)
+        self._log("初期姿勢へ移動中 (グリッパ鉛直下向き)...")
+        q_down_l = Quaternion(x=-0.707, y=0.0, z=0.0, w=0.707)
+        q_down_r = Quaternion(x= 0.707, y=0.0, z=0.0, w=0.707)
+        self.node.move_arm(robot,
+                           robot.get_planning_component(self.args.l_arm_group),
+                           plan_p, _HOME_L, self.args.l_pose_link, q_down_l)
+        self.node.move_arm(robot,
+                           robot.get_planning_component(self.args.r_arm_group),
+                           plan_p, _HOME_R, self.args.r_pose_link, q_down_r)
+        waist = robot.get_planning_component("waist_group")
+        waist.set_start_state_to_current_state()
+        waist.set_goal_state(configuration_name="waist_init_pose")
+        _plan_and_execute(robot, waist, self._log, plan_p)
         self._log("初期姿勢完了")
 
     # ──────────────────────── MoveItPy ヘルパー ────────────────────────────────
