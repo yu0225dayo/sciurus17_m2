@@ -4,8 +4,8 @@ services:
     image: sciurus17_ros2:jazzy
     container_name: sciurus17_ros2
     environment:
-      # WSLg (Windows 11 + Docker Desktop WSL2バックエンド) で自動的にGUI表示される
-      - DISPLAY=:0
+      # ホスト環境から DISPLAY を引き継ぐ (native Linux / WSLg 両対応)
+      - DISPLAY=${DISPLAY:-:0}
       - WAYLAND_DISPLAY=wayland-0
       - XDG_RUNTIME_DIR=/run/user/1000
       - ROS_DOMAIN_ID=0
@@ -17,7 +17,7 @@ services:
       - ./ws:/ros2_ws
       # robo_ros プロジェクト全体 (ros/, client/ へのアクセス用)
       - ..:/sciurus17_m2
-      # WSLg のソケット (GUI表示用)
+      # X11 ソケット (GUI表示用) — 事前に xhost +local: を実行すること
       - /tmp/.X11-unix:/tmp/.X11-unix
       - /mnt/wslg:/mnt/wslg
       - /run/user/1000/wayland-0:/run/user/1000/wayland-0
@@ -33,4 +33,11 @@ services:
       # symlink は Docker で解決されないため ttyUSB0 を直接 sciurus17spine にマッピング
       - /dev/ttyUSB0:/dev/sciurus17spine
       - /dev/bus/usb:/dev/bus/usb
+      # RealSense UVC 制御に /dev/video* が必要
+      - /dev/video0:/dev/video0
+      - /dev/video1:/dev/video1
+      - /dev/video2:/dev/video2
+      - /dev/video3:/dev/video3
+      - /dev/video4:/dev/video4
+      - /dev/video5:/dev/video5
     privileged: true
