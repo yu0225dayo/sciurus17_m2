@@ -15,23 +15,22 @@ services:
     volumes:
       # ROS2 ワークスペース
       - ./ws:/ros2_ws
-      # robo_ros プロジェクト全体 (ros/, client/ へのアクセス用)
+      # プロジェクト全体 (ros/, client/ へのアクセス用)
       - ..:/sciurus17_m2
       # X11 ソケット (GUI表示用) — 事前に xhost +local: を実行すること
       - /tmp/.X11-unix:/tmp/.X11-unix
-      - /mnt/wslg:/mnt/wslg
-      - /run/user/1000/wayland-0:/run/user/1000/wayland-0
+    network_mode: host
     stdin_open: true
     tty: true
 
-  # 実機接続用 (usbipd-win でデバイスをアタッチしてから使用)
+  # 実機接続用
   sciurus17_real:
     extends:
       service: sciurus17
     container_name: sciurus17_ros2_real
     devices:
       # symlink は Docker で解決されないため ttyUSB0 を直接 sciurus17spine にマッピング
-      - /dev/ttyUSB0:/dev/sciurus17spine
+      - /dev/sciurus17spine:/dev/sciurus17spine
       - /dev/bus/usb:/dev/bus/usb
       # RealSense UVC 制御に /dev/video* が必要
       - /dev/video0:/dev/video0

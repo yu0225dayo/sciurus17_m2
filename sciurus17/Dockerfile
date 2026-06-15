@@ -42,7 +42,7 @@ RUN apt-get update && apt-get install -y \
     ros-jazzy-xacro \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m pip install --break-system-packages --no-cache-dir plyfile
+RUN python3 -m pip install --break-system-packages --no-cache-dir 'plyfile==0.9'
 RUN python3 -m pip install --break-system-packages --no-cache-dir \
     torch --index-url https://download.pytorch.org/whl/cpu
 

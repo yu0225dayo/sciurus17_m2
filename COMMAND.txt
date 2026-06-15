@@ -1,0 +1,72 @@
+==============================
+ 初回セットアップ（別マシンへのコピー時）
+==============================
+
+【ステップ0】ROS2ワークスペースのソースを取得
+-------------------------------
+cd /home/yokada/sciurus17_m2/sciurus17
+
+mkdir -p ws/src
+git clone --branch jazzy https://github.com/rt-net/sciurus17_ros.git         ws/src/sciurus17_ros
+git clone --branch jazzy https://github.com/rt-net/sciurus17_description.git ws/src/sciurus17_description
+
+【ステップ1】Dockerイメージをビルド（初回のみ）
+-------------------------------
+cd /home/yokada/sciurus17_m2/sciurus17
+docker compose build
+
+【ステップ2】ROS2ワークスペースをビルド（初回のみ）
+-------------------------------
+cd /home/yokada/sciurus17_m2/sciurus17
+docker compose run --rm sciurus17 bash -c "
+  cd /ros2_ws && \
+  rosdep update --rosdistro jazzy && \
+  rosdep install --from-paths src --ignore-src -r -y && \
+  colcon build --symlink-install
+"
+
+【ステップ3】udevルール適用（初回のみ・ロボット接続後）
+-------------------------------
+sudo cp /home/yokada/sciurus17_m2/sciurus17/ws/src/sciurus17_ros/sciurus17_tools/rules/91-sciurus17.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+
+# 確認
+ls -la /dev/sciurus17spine
+
+
+==============================
+ 毎回の起動手順
+==============================
+
+【X11表示許可（毎回必要）】
+-------------------------------
+xhost +local:docker
+
+【GUI起動（実機モード）】
+-------------------------------
+cd /home/yokada/sciurus17_m2/sciurus17 && docker compose run --rm sciurus17_real \
+    python3 /sciurus17_m2/ros/sciurus17_gui_main.py \
+    --server-url http://10.40.1.126:8080 \
+    --launch-cmd 'bash -c "source /ros2_ws/install/setup.bash && ros2 launch sciurus17_examples demo.launch.py use_head_camera:=false use_chest_camera:=false"'
+
+
+==============================
+ その他の起動オプション
+==============================
+
+【デモモード（ROS2不要）】
+cd /home/yokada/sciurus17_m2/sciurus17 && docker compose run --rm sciurus17 \
+    python3 /sciurus17_m2/ros/sciurus17_gui_main.py \
+    --demo \
+    --demo-image /sciurus17_m2/client/saved_data/test_20260422_200416 \
+    --server-url http://10.40.1.126:8080
+
+【RViz仮想モード（実機不要）】
+cd /home/yokada/sciurus17_m2/sciurus17 && docker compose run --rm sciurus17 \
+    python3 /sciurus17_m2/ros/sciurus17_gui_rviz.py \
+    --rviz-image /sciurus17_m2/client/saved_data/test_20260422_200416 \
+    --server-url http://10.40.1.126:8080
+
+【既存コンテナに追加接続】
+docker exec -it sciurus17_ros2_real bash
