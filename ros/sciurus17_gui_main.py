@@ -57,7 +57,8 @@ try:
     from cv_bridge import CvBridge
     from geometry_msgs.msg import Point, Pose, PointStamped, PoseStamped, Quaternion
     from rclpy.node import Node
-    from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+    from rclpy.qos import (qos_profile_sensor_data,
+                            QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy)
     from sensor_msgs.msg import CameraInfo
     from sensor_msgs.msg import Image as RosImage
     from visualization_msgs.msg import Marker, MarkerArray
@@ -103,8 +104,8 @@ except ImportError as e:
     print(f"[情報] 把持生成モジュール未読み込み (torch なし?): {e}")
 
 # ── 定数 ──────────────────────────────────────────────────────────────────────
-CANVAS_W = 640
-CANVAS_H = 360
+CANVAS_W = 800
+CANVAS_H = 600
 LIVE_MS  = 50
 
 # 初期位置: 肘曲げ・+X 前方・肩高さ (base_link [m])
@@ -455,15 +456,9 @@ if _ROS2_OK:
                 self._tf_buffer   = Buffer()
                 self._tf_listener = TransformListener(self._tf_buffer, self)
 
-            _cam_qos = QoSProfile(
-                depth=1,
-                reliability=ReliabilityPolicy.RELIABLE,
-                durability=DurabilityPolicy.VOLATILE,
-                history=HistoryPolicy.KEEP_LAST,
-            )
-            self.create_subscription(RosImage,   color_topic, self._color_cb, _cam_qos)
-            self.create_subscription(RosImage,   depth_topic, self._depth_cb, _cam_qos)
-            self.create_subscription(CameraInfo, info_topic,  self._info_cb,  _cam_qos)
+            self.create_subscription(RosImage,   color_topic, self._color_cb, qos_profile_sensor_data)
+            self.create_subscription(RosImage,   depth_topic, self._depth_cb, qos_profile_sensor_data)
+            self.create_subscription(CameraInfo, info_topic,  self._info_cb,  qos_profile_sensor_data)
             self._marker_pub = self.create_publisher(MarkerArray, "/sciurus17_gui/goal_markers", 1)
 
         def publish_goal_markers(self, lh_xyz, rh_xyz, base_frame):
@@ -948,6 +943,8 @@ class SciurusGUI:
         self._rh_cam_all: np.ndarray | None = None
         self._lh_base:    np.ndarray | None = None
         self._rh_base:    np.ndarray | None = None
+        self._home_l = _HOME_L.copy()
+        self._home_r = _HOME_R.copy()
         self._lh_goal_xaxis: np.ndarray | None = None
         self._rh_goal_xaxis: np.ndarray | None = None
         self._marker_updating = False
@@ -1063,6 +1060,13 @@ class SciurusGUI:
         f1 = section("1. 起動")
         add_btn(f1, "▶  sciurus17 起動", self._on_launch, "launch", color="#3d6b3d")
         add_btn(f1, "■  停止",           self._on_kill,   "kill",   color="#6b3d3d")
+        tk.Frame(f1, height=1, bg="#555555").pack(fill=tk.X, pady=3)
+        add_btn(f1, "○  グリッパ 開",      self._on_gripper_open,  "g_open")
+        add_btn(f1, "●  グリッパ 閉",      self._on_gripper_close, "g_close")
+        tk.Frame(f1, height=1, bg="#555555").pack(fill=tk.X, pady=3)
+        add_btn(f1, "⌂  初期姿勢へ (両)",  self._on_home,       "home")
+        add_btn(f1, "⌂  左初期姿勢",       self._on_home_left,  "home_left")
+        add_btn(f1, "⌂  右初期姿勢",       self._on_home_right, "home_right")
 
         # 2. カメラ・頭部制御
         f2 = section("2. カメラ・頭部制御")
@@ -1085,13 +1089,23 @@ class SciurusGUI:
         add_btn(f2, "フレーム取得",  self._on_capture,   "capture")
         add_btn(f2, "Log",          self._open_log_win, "log_btn")
 
-        # 3. 姿勢推定
-        f4 = section("3. 姿勢推定")
+        # 3. 姿勢推定・補正
+        self._offset_x_var = tk.DoubleVar(value=0.0)
+        self._offset_y_var = tk.DoubleVar(value=0.0)
+        self._offset_z_var = tk.DoubleVar(value=0.15)
+        for v in (self._offset_x_var, self._offset_y_var, self._offset_z_var):
+            v.trace_add("write", lambda *_: self._republish_goal_markers())
+        f4 = section("3. 姿勢推定・補正")
         tk.Label(f4, text="画像クリックで物体を選択",
                  bg=PANEL_BG, fg="#888888", font=("Helvetica", 8)).pack(anchor="w")
-        add_btn(f4, "↺  物体を再選択",           self._on_reselect, "reselect")
+        add_btn(f4, "↩  別の物体を選択",         self._on_reselect, "reselect")
+        tk.Frame(f4, height=1, bg="#555555").pack(fill=tk.X, pady=3)
         add_btn(f4, "→  計算機へ送信・姿勢推定", self._on_estimate, "estimate")
-        add_btn(f4, "→  把持姿勢生成",           self._on_grasp,    "grasp")
+        tk.Frame(f4, height=1, bg="#555555").pack(fill=tk.X, pady=6)
+        spinrow(f4, "X オフセット [m] (前方+):", self._offset_x_var, -3.0, 3.0, 0.05, "%.2f")
+        spinrow(f4, "Y オフセット [m] (左+):",   self._offset_y_var, -3.0, 3.0, 0.05, "%.2f")
+        spinrow(f4, "Z オフセット [m] (上+):",   self._offset_z_var, -2.0, 2.0, 0.05, "%.2f")
+        add_btn(f4, "↻  再計算・マーカ更新",     self._on_grasp,    "grasp", color="#4a5a3a")
 
         # 4. アーム制御（3列: 共通 / 左アーム / 右アーム）
         f5 = section("4. アーム制御")
@@ -1106,30 +1120,15 @@ class SciurusGUI:
         f5_col2.pack(side=tk.LEFT, fill=tk.Y)
 
         # 列0: 共通ボタン
-        self._offset_x_var = tk.DoubleVar(value=0.0)
-        self._offset_y_var = tk.DoubleVar(value=0.0)
-        self._offset_z_var = tk.DoubleVar(value=0.15)
-        for v in (self._offset_x_var, self._offset_y_var, self._offset_z_var):
-            v.trace_add("write", lambda *_: self._republish_goal_markers())
-        spinrow(f5_col0, "X offset [m]:", self._offset_x_var, -0.5, 0.5, incr=0.01, fmt="%.2f")
-        spinrow(f5_col0, "Y offset [m]:", self._offset_y_var, -0.5, 0.5, incr=0.01, fmt="%.2f")
-        spinrow(f5_col0, "Z offset [m]:", self._offset_z_var, -0.5, 0.5, incr=0.01, fmt="%.2f")
-        tk.Frame(f5_col0, height=1, bg="#555555").pack(fill=tk.X, pady=3)
-        add_btn(f5_col0, "⟳  マーカー更新",      self._republish_goal_markers, "marker_update", color="#4a4a2a")
-        add_btn(f5_col0, "▶  両アームを移動",    self._on_move,              "move",              color="#3d5b7a")
-        add_btn(f5_col0, "▶  左アームのみ",      self._on_move_left,         "move_left",         color="#3a547a")
-        add_btn(f5_col0, "▶  右アームのみ",      self._on_move_right,        "move_right",        color="#3a547a")
+        add_btn(f5_col0, "▶  両アームを移動",      self._on_move,              "move",              color="#3d5b7a")
+        add_btn(f5_col0, "▶  左アームのみ",        self._on_move_left,         "move_left",         color="#3a547a")
+        add_btn(f5_col0, "▶  右アームのみ",        self._on_move_right,        "move_right",        color="#3a547a")
         tk.Frame(f5_col0, height=1, bg="#555555").pack(fill=tk.X, pady=3)
         add_btn(f5_col0, "⇒  両: 移動+R6→R7回転", self._on_move_align_both,  "move_align_both",   color="#2d5a6a")
         add_btn(f5_col0, "⇒  左: 移動+R6→R7回転", self._on_move_align_left,  "move_align_left",   color="#2a4a6a")
         add_btn(f5_col0, "⇒  右: 移動+R6→R7回転", self._on_move_align_right, "move_align_right",  color="#2a4a6a")
         tk.Frame(f5_col0, height=1, bg="#555555").pack(fill=tk.X, pady=3)
-        add_btn(f5_col0, "○  グリッパ 開",      self._on_gripper_open,  "g_open")
-        add_btn(f5_col0, "●  グリッパ 閉",      self._on_gripper_close, "g_close")
-        add_btn(f5_col0, "⌂  初期姿勢へ (両)",  self._on_home,       "home")
-        add_btn(f5_col0, "⌂  左初期姿勢",       self._on_home_left,  "home_left")
-        add_btn(f5_col0, "⌂  右初期姿勢",       self._on_home_right, "home_right")
-        add_btn(f5_col0, "⊕  関節マーカ更新",   self._on_joint_markers, "joint_markers", color="#5a4a2a")
+        add_btn(f5_col0, "⊕  関節マーカ更新",     self._on_joint_markers, "joint_markers", color="#5a4a2a")
 
         # 列1: 左アーム j5/j6/j7
         self._l_roll_var  = tk.DoubleVar(value=0.0)
@@ -1193,7 +1192,7 @@ class SciurusGUI:
     # ──────────────────────── ライブ映像 ───────────────────────────────────────
 
     def _poll_live(self):
-        if self._state in (S_CAMERA, S_ESTIMATING, S_GRASP_READY, S_MOVING, S_DONE):
+        if self._state in (S_CAMERA, S_SELECTED, S_ESTIMATING, S_GRASP_READY, S_MOVING, S_DONE):
             frame = self.node.get_latest_rgb()
             if frame is not None:
                 self._show_frame(frame, overlay_text="LIVE")
@@ -1269,8 +1268,7 @@ class SciurusGUI:
             "head_home":   can_arm,
             "reselect":    s in (S_SELECTED, S_GRASP_READY, S_DONE) and not w,
             "estimate":    s == S_SELECTED and not w,
-            "grasp":       s == S_GRASP_READY and not w,
-            "marker_update":     s == S_DONE and not w,
+            "grasp":       s in (S_GRASP_READY, S_DONE) and not w,
             "move":              s == S_DONE and not w,
             "move_left":         s == S_DONE and not w,
             "move_right":        s == S_DONE and not w,
@@ -1466,6 +1464,9 @@ class SciurusGUI:
         if self._click_x < 0:
             self._log("[エラー] 画像をクリックして物体を選択してください")
             return
+        frame = self.node.get_latest_rgb()
+        if frame is not None:
+            self._show_frame(frame, overlay_text="LIVE")
         self._set_state(S_ESTIMATING)
         self._run_bg(self._do_estimate, on_error_state=S_SELECTED)
 
@@ -1711,9 +1712,6 @@ class SciurusGUI:
             )
             self._lh_coord_var.set(f"{lh[0]:.3f}, {lh[1]:.3f}, {lh[2]:.3f}")
             self._rh_coord_var.set(f"{rh[0]:.3f}, {rh[1]:.3f}, {rh[2]:.3f}")
-            self._offset_x_var.set(0.0)
-            self._offset_y_var.set(0.0)
-            self._offset_z_var.set(0.0)
         finally:
             self._marker_updating = False
 
@@ -1940,8 +1938,8 @@ class SciurusGUI:
             _plan_and_execute(robot, comp, log, g_plan_p)
 
         log("[Step 5] 初期姿勢へ (グリッパ鉛直下向き)...")
-        self.node.move_arm(robot, l_arm, init_plan_p, _HOME_L, self.args.l_pose_link, q_l)
-        self.node.move_arm(robot, r_arm, init_plan_p, _HOME_R, self.args.r_pose_link, q_r)
+        self.node.move_arm(robot, l_arm, init_plan_p, self._home_l, self.args.l_pose_link, q_l)
+        self.node.move_arm(robot, r_arm, init_plan_p, self._home_r, self.args.r_pose_link, q_r)
 
         log("[Step 5] グリッパ開放...")
         set_gripper(l_gripper, "l_gripper_group", OPEN_L)
@@ -1951,12 +1949,10 @@ class SciurusGUI:
         if lh_target is None or rh_target is None:
             self._log("[エラー] 座標の形式が正しくありません (例: 0.123, 0.456, 0.789)")
             return
-        offset = np.array([self._offset_x_var.get(),
-                           self._offset_y_var.get(),
-                           self._offset_z_var.get()])
+        offset = self._get_offset()
         log(f"[Step 5] グラスプ位置へ移動 (offset={offset})...")
-        self.node.move_arm(robot, l_arm, plan_p, lh_target + offset, self.args.l_pose_link, q_l)
-        self.node.move_arm(robot, r_arm, plan_p, rh_target + offset, self.args.r_pose_link, q_r)
+        self.node.move_arm(robot, l_arm, plan_p, self._lh_base + offset, self.args.l_pose_link, q_l)
+        self.node.move_arm(robot, r_arm, plan_p, self._rh_base + offset, self.args.r_pose_link, q_r)
 
         log("[Step 5] グリッパ閉鎖 (把持)...")
         set_gripper(l_gripper, "l_gripper_group", GRASP_L)
@@ -2005,18 +2001,17 @@ class SciurusGUI:
             gripper.set_goal_state(robot_state=rs)
             _plan_and_execute(robot, gripper, log, g_plan_p)
 
-        home_pos = _HOME_L if side == "left" else _HOME_R
+        home_pos = self._home_l if side == "left" else self._home_r
         log(f"[{side}アーム] 初期姿勢へ (グリッパ鉛直下向き)...")
         self.node.move_arm(robot, arm, init_plan_p, home_pos, pose_link, orientation)
 
         log(f"[{side}アーム] グリッパ開放...")
         set_gripper(open_angle)
 
-        offset = np.array([self._offset_x_var.get(),
-                           self._offset_y_var.get(),
-                           self._offset_z_var.get()])
+        offset = self._get_offset()
+        base = self._lh_base if side == "left" else self._rh_base
         log(f"[{side}アーム] グラスプ位置へ移動 (offset={offset})...")
-        self.node.move_arm(robot, arm, plan_p, wrist_base + offset, pose_link, orientation)
+        self.node.move_arm(robot, arm, plan_p, base + offset, pose_link, orientation)
 
         log(f"[{side}アーム] グリッパ閉鎖...")
         set_gripper(grasp_angle)
