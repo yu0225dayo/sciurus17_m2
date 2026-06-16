@@ -393,31 +393,55 @@ class VisualizationWindow:
 class LogWindow:
     """ログ専用ウィンドウ。閉じても withdraw するだけで再表示できる。"""
 
+    _TAGS = {
+        "error":   {"foreground": "#ff5555", "font": ("Courier", 11, "bold")},
+        "warn":    {"foreground": "#ffcc00", "font": ("Courier", 11, "bold")},
+        "ok":      {"foreground": "#55ff55", "font": ("Courier", 11)},
+        "ros":     {"foreground": "#88ccff", "font": ("Courier", 11)},
+        "normal":  {"foreground": "#dddddd", "font": ("Courier", 11)},
+    }
+
     def __init__(self, parent: tk.Tk):
         self.win = tk.Toplevel(parent)
         self.win.title("sciurus17 Log")
         self.win.configure(bg=BG)
+        self.win.geometry("900x400")
         self.win.protocol("WM_DELETE_WINDOW", self.win.withdraw)
 
         btn_frame = tk.Frame(self.win, bg=BG)
         btn_frame.pack(fill=tk.X, padx=4, pady=(4, 0))
         tk.Button(btn_frame, text="クリア", command=self._clear,
                   bg=BTN_BG, fg=BTN_FG, relief=tk.FLAT,
-                  font=("Helvetica", 9), padx=6).pack(side=tk.RIGHT)
+                  font=("Helvetica", 10), padx=8).pack(side=tk.RIGHT)
 
         from tkinter import scrolledtext as _st
         self._area = _st.ScrolledText(
-            self.win, width=100, height=30,
-            bg=LOG_BG, fg=LOG_FG, font=("Courier", 9),
+            self.win, width=100, height=20,
+            bg=LOG_BG, fg="#dddddd", font=("Courier", 11),
             state=tk.DISABLED, wrap=tk.WORD,
         )
         self._area.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        for tag, cfg in self._TAGS.items():
+            self._area.tag_configure(tag, **cfg)
 
     def append(self, msg: str):
+        tag = self._classify(msg)
         self._area.configure(state=tk.NORMAL)
-        self._area.insert(tk.END, msg)
+        self._area.insert(tk.END, msg, tag)
         self._area.see(tk.END)
         self._area.configure(state=tk.DISABLED)
+
+    def _classify(self, msg: str) -> str:
+        m = msg.lower()
+        if any(k in m for k in ("[エラー]", "error", "[起動エラー]", "失敗", "traceback")):
+            return "error"
+        if any(k in m for k in ("warn", "[警告]", "warning")):
+            return "warn"
+        if any(k in m for k in ("[起動]", "[停止]", "成功", "完了", "ok")):
+            return "ok"
+        if "[ros]" in m:
+            return "ros"
+        return "normal"
 
     def _clear(self):
         self._area.configure(state=tk.NORMAL)
@@ -1108,7 +1132,7 @@ class SciurusGUI:
         spinrow(f4, "X オフセット [m] (前方+):", self._offset_x_var, -3.0, 3.0, 0.05, "%.2f")
         spinrow(f4, "Y オフセット [m] (左+):",   self._offset_y_var, -3.0, 3.0, 0.05, "%.2f")
         spinrow(f4, "Z オフセット [m] (上+):",   self._offset_z_var, -2.0, 2.0, 0.05, "%.2f")
-        add_btn(f4, "↻  再計算・マーカ更新",     self._on_grasp,    "grasp", color="#4a5a3a")
+        add_btn(f4, "↻  マーカ再配置 (平行移動)", self._republish_goal_markers, "reposition", color="#4a5a3a")
 
         # 4. アーム制御（3列: 共通 / 左アーム / 右アーム）
         f5 = section("4. アーム制御")
@@ -1386,11 +1410,6 @@ class SciurusGUI:
                     for line in self._camera_process.stdout:
                         self._log(f"[CAM] {line.rstrip()}")
                 threading.Thread(target=_read, daemon=True).start()
-                # トピックが来るまで最大10秒待つ
-                for _ in range(20):
-                    time.sleep(0.5)
-                    if self.node.get_latest_rgb() is not None:
-                        break
             except Exception as e:
                 self._log(f"[カメラ起動エラー] {e}")
                 return
@@ -2384,7 +2403,7 @@ def main():
                         default="/head_camera/color/camera_info")
     parser.add_argument("--depth-scale", type=float, default=0.001)
 
-    parser.add_argument("--camera-frame", default="camera_color_optical_frame")
+    parser.add_argument("--camera-frame", default="head_camera_color_optical_frame")
     parser.add_argument("--base-frame",   default="base_link")
     parser.add_argument("--l-arm-group",  default="l_arm_group")
     parser.add_argument("--r-arm-group",  default="r_arm_group")
@@ -2403,8 +2422,8 @@ def main():
     parser.add_argument("--launch-cmd", default="",
                         help="sciurus17 起動コマンド (例: ros2 launch ...)")
     parser.add_argument("--camera-launch-cmd",
-                        default="ros2 launch sciurus17_vision head_camera.launch.py",
-                        help="カメラ起動コマンド (カメラ接続ボタンで実行)")
+                        default="",
+                        help="カメラ起動コマンド (カメラ接続ボタンで実行。demo.launch.py が起動済みの場合は空でよい)")
 
     args = parser.parse_args()
 
