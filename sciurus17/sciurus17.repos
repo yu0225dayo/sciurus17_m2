@@ -1,0 +1,9 @@
+repositories:
+  sciurus17_ros:
+    type: git
+    url: https://github.com/yu0225dayo/sciurus17_ros.git
+    version: jazzy
+  sciurus17_description:
+    type: git
+    url: https://github.com/rt-net/sciurus17_description.git
+    version: jazzy
