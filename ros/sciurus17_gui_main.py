@@ -429,10 +429,12 @@ class LogWindow:
         self.win.lift()
 
 
-def _plan_and_execute(robot, comp, log_fn, params) -> bool:
+def _plan_and_execute(robot, comp, log_fn, params, traj_out=None) -> bool:
     result = comp.plan(single_plan_parameters=params)
     if result:
         robot.execute(result.trajectory, controllers=[])
+        if traj_out is not None:
+            traj_out.append(result.trajectory)
         return True
     log_fn("軌道計画失敗")
     return False
@@ -596,7 +598,7 @@ if _ROS2_OK:
             return np.array([pt_b.point.x, pt_b.point.y, pt_b.point.z])
 
         def move_arm(self, robot, arm_comp, params, xyz_base, pose_link,
-                     orientation=None) -> bool:
+                     orientation=None, traj_out=None) -> bool:
             """MoveItPy で目標位置へ移動。orientation 省略時は FK で現在の向きを維持。"""
             if orientation is None:
                 with robot.get_planning_scene_monitor().read_only() as scene:
@@ -617,7 +619,7 @@ if _ROS2_OK:
             )
             arm_comp.set_start_state_to_current_state()
             arm_comp.set_goal_state(pose_stamped_msg=goal, pose_link=pose_link)
-            return _plan_and_execute(robot, arm_comp, self.get_logger().error, params)
+            return _plan_and_execute(robot, arm_comp, self.get_logger().error, params, traj_out=traj_out)
 
         def move_arm_wrist(self, robot, arm_comp, params,
                            roll: float, pitch: float, yaw: float,
@@ -898,7 +900,7 @@ class DemoRobotNode:
     def read_link_direction(self, robot, link6_name: str, pose_link: str):
         return np.array([0.35, 0.15, 0.30]), np.array([1.0, 0.0, 0.0])
 
-    def move_arm(self, robot, arm_comp, params, xyz_base, pose_link, orientation=None) -> bool:
+    def move_arm(self, robot, arm_comp, params, xyz_base, pose_link, orientation=None, traj_out=None) -> bool:
         time.sleep(0.5)
         return True
 
@@ -947,6 +949,7 @@ class SciurusGUI:
         self._home_r = _HOME_R.copy()
         self._lh_goal_xaxis: np.ndarray | None = None
         self._rh_goal_xaxis: np.ndarray | None = None
+        self._loaded_plan: list = []
         self._marker_updating = False
         self._robot                      = None
         self._process: subprocess.Popen | None = None
@@ -1128,7 +1131,15 @@ class SciurusGUI:
         add_btn(f5_col0, "⇒  左: 移動+R6→R7回転", self._on_move_align_left,  "move_align_left",   color="#2a4a6a")
         add_btn(f5_col0, "⇒  右: 移動+R6→R7回転", self._on_move_align_right, "move_align_right",  color="#2a4a6a")
         tk.Frame(f5_col0, height=1, bg="#555555").pack(fill=tk.X, pady=3)
-        add_btn(f5_col0, "⊕  関節マーカ更新",     self._on_joint_markers, "joint_markers", color="#5a4a2a")
+        add_btn(f5_col0, "○  グリッパ 開",      self._on_gripper_open,  "g_open")
+        add_btn(f5_col0, "●  グリッパ 閉",      self._on_gripper_close, "g_close")
+        add_btn(f5_col0, "⌂  初期姿勢へ (両)",  self._on_home,       "home")
+        add_btn(f5_col0, "⌂  左初期姿勢",       self._on_home_left,  "home_left")
+        add_btn(f5_col0, "⌂  右初期姿勢",       self._on_home_right, "home_right")
+        add_btn(f5_col0, "⊕  関節マーカ更新",   self._on_joint_markers, "joint_markers", color="#5a4a2a")
+        tk.Frame(f5_col0, height=1, bg="#555555").pack(fill=tk.X, pady=3)
+        add_btn(f5_col0, "↑  計画を読み込み",  self._on_load_plan,  "load_plan",  color="#4a5a1a")
+        add_btn(f5_col0, "▷  計画を実行",      self._on_exec_plan,  "exec_plan",  color="#3a5a1a")
 
         # 列1: 左アーム j5/j6/j7
         self._l_roll_var  = tk.DoubleVar(value=0.0)
@@ -1283,6 +1294,8 @@ class SciurusGUI:
             "home":              can_arm,
             "home_left":         can_arm,
             "home_right":        can_arm,
+            "load_plan":         not w,
+            "exec_plan":         bool(self._loaded_plan) and not w,
             "log_btn":           True,
         }
         for key, btn in self._btns.items():
@@ -2239,6 +2252,58 @@ class SciurusGUI:
         except Exception as e:
             self._log(f"[警告] 方向マーカ更新失敗: {e}")
 
+    # ──────────────────────── 計画ロード実行 ───────────────────────────────────
+
+    def _on_load_plan(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            filetypes=[("Plan file", "*.plan"), ("All files", "*.*")],
+            title="計画ファイルを開く",
+        )
+        if not path:
+            return
+        try:
+            import pickle
+            from rclpy.serialization import deserialize_message
+            from moveit_msgs.msg import RobotTrajectory
+            with open(path, "rb") as f:
+                raw = pickle.load(f)
+            steps = []
+            for s in raw:
+                step = dict(s)
+                if step.get("type") == "arm" and isinstance(step.get("trajectory"), bytes):
+                    step["trajectory"] = deserialize_message(step["trajectory"], RobotTrajectory)
+                steps.append(step)
+            self._loaded_plan = steps
+            self._log(f"[計画読み込み完了] {len(steps)} ステップ: {path}")
+            for i, s in enumerate(steps):
+                self._log(f"  Step {i+1}: [{s['type']}] {s['label']} ({s.get('group','-')})")
+            self._refresh_ui()
+        except Exception as e:
+            self._log(f"[計画読み込みエラー] {e}")
+
+    def _on_exec_plan(self):
+        if not self._loaded_plan:
+            self._log("[計画実行] 計画がロードされていません。先に「計画を読み込み」を実行してください。")
+            return
+        self._set_state(S_MOVING)
+        self._run_bg(self._do_exec_plan, on_error_state=S_DONE)
+
+    def _do_exec_plan(self):
+        robot = self._get_robot()
+        total = len(self._loaded_plan)
+        self._log(f"[計画実行開始] {total} ステップ")
+        for i, step in enumerate(self._loaded_plan):
+            label = step.get("label", f"Step {i+1}")
+            self._log(f"[実行] Step {i+1}/{total}: {label}")
+            if step["type"] == "arm":
+                robot.execute(step["trajectory"], controllers=[])
+                time.sleep(0.5)
+            elif step["type"] == "gripper":
+                self._log(f"  → グリッパステップはスキップ (手動操作): {label}")
+        self._log("[計画実行完了]")
+        self.root.after(0, lambda: self._set_state(S_DONE))
+
     # ──────────────────────── MoveItPy ヘルパー ────────────────────────────────
 
     def _get_robot(self):
@@ -2273,11 +2338,13 @@ class SciurusGUI:
         return self._robot
 
     @staticmethod
-    def _make_plan_params(robot, vel=0.1):
+    def _make_plan_params(robot, vel=0.1, planning_time=10.0, attempts=5):
         from moveit.planning import PlanRequestParameters
         p = PlanRequestParameters(robot, "ompl_rrtc_default")
         p.max_velocity_scaling_factor     = vel
         p.max_acceleration_scaling_factor = vel
+        p.planning_time                   = planning_time
+        p.num_planning_attempts           = attempts
         return p
 
     # ──────────────────────── 終了処理 ─────────────────────────────────────────

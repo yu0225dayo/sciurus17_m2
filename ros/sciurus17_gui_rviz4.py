@@ -408,10 +408,12 @@ def _remove_display_motion_path(cfg: dict):
             cfg[key] = ' '.join(v for v in value.split() if 'DisplayMotionPath' not in v)
 
 
-def _plan_and_execute(robot, comp, log_fn, params) -> bool:
+def _plan_and_execute(robot, comp, log_fn, params, traj_out=None) -> bool:
     result = comp.plan(single_plan_parameters=params)
     if result:
         robot.execute(result.trajectory, controllers=[])
+        if traj_out is not None:
+            traj_out.append(result.trajectory)
         return True
     log_fn("軌道計画失敗")
     return False
@@ -1004,7 +1006,7 @@ class RvizRobotNode(Node):
         self._pub_display_path.publish(DisplayTrajectory())
 
     def move_arm(self, robot, arm_comp, params, xyz_base, pose_link: str,
-                 orientation: "Quaternion | None" = None) -> bool:
+                 orientation: "Quaternion | None" = None, traj_out=None) -> bool:
         """MoveItPy で目標位置へ移動。orientation 省略時は現在の向きを FK で維持。"""
         if orientation is None:
             with robot.get_planning_scene_monitor().read_only() as scene:
@@ -1025,7 +1027,7 @@ class RvizRobotNode(Node):
         )
         arm_comp.set_start_state_to_current_state()
         arm_comp.set_goal_state(pose_stamped_msg=goal, pose_link=pose_link)
-        ok = _plan_and_execute(robot, arm_comp, self.get_logger().error, params)
+        ok = _plan_and_execute(robot, arm_comp, self.get_logger().error, params, traj_out=traj_out)
         time.sleep(0.3)
         self.clear_planned_path()
         return ok
@@ -1122,6 +1124,7 @@ class SciurusRvizGUI:
         self._rh_cam_all: np.ndarray | None  = None
         self._lh_goal_xaxis: np.ndarray | None = None
         self._rh_goal_xaxis: np.ndarray | None = None
+        self._plan_steps: list = []
         self._robot                          = None
         self._process: subprocess.Popen | None = None
         self._vis_win: VisualizationWindow | None = None
@@ -1289,6 +1292,9 @@ class SciurusRvizGUI:
         add_btn(f5_col0, "⇒  右: 移動+R6→R7回転", self._on_move_align_right, "move_align_right",  color="#2a4a6a")
         tk.Frame(f5_col0, height=1, bg="#555555").pack(fill=tk.X, pady=3)
         add_btn(f5_col0, "⊕  関節マーカ更新",  self._on_joint_markers, "joint_markers", color="#5a4a2a")
+        tk.Frame(f5_col0, height=1, bg="#555555").pack(fill=tk.X, pady=3)
+        add_btn(f5_col0, "↓  計画を保存",  self._on_save_plan,  "save_plan",  color="#5a4a1a")
+        add_btn(f5_col0, "↺  計画クリア",  self._on_clear_plan, "clear_plan", color="#5a3a1a")
 
         # 列1: 左アーム
         self._l_yaw_var   = tk.DoubleVar(value=0.0)
@@ -1434,6 +1440,8 @@ class SciurusRvizGUI:
             "home_left":       can_arm,
             "home_right":      can_arm,
             "joint_markers":   can_arm,
+            "save_plan":       s == S_DONE and not w,
+            "clear_plan":      not w,
         }
         for key, btn in self._btns.items():
             btn.config(state=tk.NORMAL if enabled.get(key, False) else tk.DISABLED)
@@ -1767,9 +1775,14 @@ class SciurusRvizGUI:
         r_arm  = robot.get_planning_component(self.args.r_arm_group)
 
         self._log("[移動] グラスプ位置へ移動中 (現在の向きを維持)...")
-        self.node.move_arm(robot, l_arm, self._make_plan_params(robot, vel=0.1), self._lh_base, self.args.l_pose_link)
-        self.node.move_arm(robot, r_arm, self._make_plan_params(robot, vel=0.1), self._rh_base, self.args.r_pose_link)
-        self._log("[移動完了] RViz で動作を確認してください")
+        traj_l, traj_r = [], []
+        self.node.move_arm(robot, l_arm, self._make_plan_params(robot, vel=0.1), self._lh_base, self.args.l_pose_link, traj_out=traj_l)
+        self.node.move_arm(robot, r_arm, self._make_plan_params(robot, vel=0.1), self._rh_base, self.args.r_pose_link, traj_out=traj_r)
+        for t in traj_l:
+            self._plan_steps.append({"type": "arm", "label": "左アームグラスプ位置へ移動", "group": self.args.l_arm_group, "trajectory": t})
+        for t in traj_r:
+            self._plan_steps.append({"type": "arm", "label": "右アームグラスプ位置へ移動", "group": self.args.r_arm_group, "trajectory": t})
+        self._log(f"[移動完了] 計画ステップ数: {len(self._plan_steps)} — RViz で動作を確認してください")
         self.node.publish_joint_markers(robot)
         self.root.after(0, lambda: self._set_state(S_DONE))
 
@@ -1787,8 +1800,12 @@ class SciurusRvizGUI:
         arm    = robot.get_planning_component(arm_group)
 
         self._log(f"[{side}アーム] グラスプ位置へ移動中 (現在の向きを維持)...")
-        self.node.move_arm(robot, arm, plan_p, wrist_base, pose_link)
-        self._log(f"[{side}アーム完了]")
+        traj_out = []
+        self.node.move_arm(robot, arm, plan_p, wrist_base, pose_link, traj_out=traj_out)
+        label = "左アームグラスプ位置へ移動" if side == "left" else "右アームグラスプ位置へ移動"
+        for t in traj_out:
+            self._plan_steps.append({"type": "arm", "label": label, "group": arm_group, "trajectory": t})
+        self._log(f"[{side}アーム完了] 計画ステップ数: {len(self._plan_steps)}")
 
     def _do_move_left(self):
         self._move_single_arm(self._get_robot(), "left")
@@ -1896,10 +1913,13 @@ class SciurusRvizGUI:
         qx, qy, qz, qw = Rotation.from_matrix(R_base).as_quat()
         orientation = Quaternion(x=float(qx), y=float(qy), z=float(qz), w=float(qw))
         arm = robot.get_planning_component(arm_group)
-        ok = self.node.move_arm(robot, arm, plan_p, wrist_base, pose_link, orientation)
-
+        traj_out = []
+        ok = self.node.move_arm(robot, arm, plan_p, wrist_base, pose_link, orientation, traj_out=traj_out)
         if ok:
-            self._log(f"[{side}移動+回転完了]")
+            label = f"{'左' if side == 'left' else '右'}アーム移動+回転(align)"
+            for t in traj_out:
+                self._plan_steps.append({"type": "arm", "label": label, "group": arm_group, "trajectory": t})
+            self._log(f"[{side}移動+回転完了] 計画ステップ数: {len(self._plan_steps)}")
             self.node.publish_joint_markers(robot)
             try:
                 lh_pos, lh_dir = self.node.read_link_direction(robot, "l_link6", self.args.l_pose_link)
@@ -2257,6 +2277,43 @@ class SciurusRvizGUI:
         except Exception as e:
             self._log(f"[警告] 方向マーカ更新失敗: {e}")
             self.node.publish_home_direction_markers(_HOME_L, _HOME_R)
+
+    # ──────────────────────── 計画保存 ─────────────────────────────────────────
+
+    def _on_save_plan(self):
+        if not self._plan_steps:
+            self._log("[計画保存] 保存する計画がありません。移動ボタンで計画を実行してから保存してください。")
+            return
+        from tkinter import filedialog
+        path = filedialog.asksaveasfilename(
+            defaultextension=".plan",
+            filetypes=[("Plan file", "*.plan"), ("All files", "*.*")],
+            initialfile="grasp_plan.plan",
+            title="計画ファイルを保存",
+        )
+        if not path:
+            return
+        self._run_bg(lambda: self._do_save_plan(path))
+
+    def _do_save_plan(self, path: str):
+        import pickle
+        from rclpy.serialization import serialize_message
+        data = []
+        for step in self._plan_steps:
+            s = dict(step)
+            if s.get("type") == "arm" and "trajectory" in s:
+                s["trajectory"] = serialize_message(s["trajectory"])
+            data.append(s)
+        with open(path, "wb") as f:
+            pickle.dump(data, f)
+        self._log(f"[計画保存完了] {len(data)} ステップ → {path}")
+        for i, s in enumerate(data):
+            self._log(f"  Step {i+1}: [{s['type']}] {s['label']} ({s.get('group','-')})")
+        self.root.after(0, lambda: self._set_state(S_DONE))
+
+    def _on_clear_plan(self):
+        self._plan_steps.clear()
+        self._log("[計画クリア] 蓄積した計画ステップをリセットしました")
 
     # ──────────────────────── MoveItPy ヘルパー ────────────────────────────────
 
