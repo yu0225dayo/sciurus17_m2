@@ -1017,7 +1017,6 @@ class RvizRobotNode(Node):
         p.max_velocity_scaling_factor     = 0.1
         p.max_acceleration_scaling_factor = 0.1
         p.planning_time                   = 5.0
-        p.num_planning_attempts           = 3
         ok = _plan_and_execute(robot, waist, self.get_logger().error, p, traj_out=traj_out)
         time.sleep(0.2)
         self.clear_planned_path()

@@ -819,7 +819,6 @@ if _ROS2_OK:
             p.max_velocity_scaling_factor     = 0.1
             p.max_acceleration_scaling_factor = 0.1
             p.planning_time                   = 5.0
-            p.num_planning_attempts           = 3
             ok = _plan_and_execute(robot, waist, self.get_logger().error, p)
             time.sleep(0.2)
             return ok
@@ -2470,7 +2469,6 @@ class SciurusGUI:
         p.max_velocity_scaling_factor     = vel
         p.max_acceleration_scaling_factor = vel
         p.planning_time                   = planning_time
-        p.num_planning_attempts           = attempts
         return p
 
     # ──────────────────────── 終了処理 ─────────────────────────────────────────
