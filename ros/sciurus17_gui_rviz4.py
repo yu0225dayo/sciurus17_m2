@@ -413,7 +413,7 @@ def _plan_and_execute(robot, comp, log_fn, params, traj_out=None) -> bool:
     if result:
         robot.execute(result.trajectory, controllers=[])
         if traj_out is not None:
-            traj_out.append(result.trajectory)
+            traj_out.append(result.trajectory.get_robot_trajectory_msg())
         return True
     log_fn("軌道計画失敗")
     return False
