@@ -1297,7 +1297,7 @@ class SciurusRvizGUI:
         save_row.pack(fill=tk.X, pady=(2, 0))
         tk.Label(save_row, text="保存先:", bg=PANEL_BG, fg="#aaaaaa",
                  font=("Helvetica", 8)).pack(side=tk.LEFT)
-        self._save_path_var = tk.StringVar(value="/tmp/grasp_plan.plan")
+        self._save_path_var = tk.StringVar(value="/sciurus17_m2/grasp_plan.plan")
         tk.Entry(save_row, textvariable=self._save_path_var,
                  bg="#444444", fg="white", font=("Courier", 8),
                  width=22).pack(side=tk.LEFT, padx=2, fill=tk.X, expand=True)
