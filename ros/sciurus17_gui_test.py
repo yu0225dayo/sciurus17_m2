@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 sciurus17 把持コントロールパネル (tkinter GUI) — メインモード
 
@@ -1162,8 +1162,9 @@ class SciurusGUI:
         add_btn(f5_col0, "⌂  右初期姿勢",       self._on_home_right, "home_right")
         add_btn(f5_col0, "⊕  関節マーカ更新",   self._on_joint_markers, "joint_markers", color="#5a4a2a")
         tk.Frame(f5_col0, height=1, bg="#555555").pack(fill=tk.X, pady=3)
-        add_btn(f5_col0, "↑  計画を読み込み",  self._on_load_plan,  "load_plan",  color="#4a5a1a")
-        add_btn(f5_col0, "▷  計画を実行",      self._on_exec_plan,  "exec_plan",  color="#3a5a1a")
+        add_btn(f5_col0, "↑  計画を読み込み",  self._on_load_plan,   "load_plan",   color="#4a5a1a")
+        add_btn(f5_col0, "▷  計画を全実行",   self._on_exec_plan,   "exec_plan",   color="#3a5a1a")
+        add_btn(f5_col0, "↺  計画クリア",     self._on_clear_plan,  "clear_plan",  color="#5a3a1a")
 
         # 列1: 左アーム j5/j6/j7
         self._l_roll_var  = tk.DoubleVar(value=0.0)
@@ -1320,6 +1321,7 @@ class SciurusGUI:
             "home_right":        can_arm,
             "load_plan":         not w,
             "exec_plan":         bool(self._loaded_plan) and not w,
+            "clear_plan":        bool(self._loaded_plan) and not w,
             "log_btn":           True,
         }
         for key, btn in self._btns.items():
@@ -1769,8 +1771,8 @@ class SciurusGUI:
     # ──────────────────────── アーム移動 ───────────────────────────────────────
 
     def _on_move(self):
-        if self._lh_base is None or self._rh_base is None:
-            self._log("[エラー] 把持座標が生成されていません")
+        if not self._loaded_plan and (self._lh_base is None or self._rh_base is None):
+            self._log("[エラー] 把持座標が生成されていません (または計画をロードしてください)")
             return
         self._set_state(S_MOVING)
         self._run_bg(
@@ -1779,8 +1781,8 @@ class SciurusGUI:
         )
 
     def _on_move_left(self):
-        if self._lh_base is None:
-            self._log("[エラー] 左手把持座標が生成されていません")
+        if not self._loaded_plan and self._lh_base is None:
+            self._log("[エラー] 左手把持座標が生成されていません (または計画をロードしてください)")
             return
         self._set_state(S_MOVING)
         self._run_bg(
@@ -1789,8 +1791,8 @@ class SciurusGUI:
         )
 
     def _on_move_right(self):
-        if self._rh_base is None:
-            self._log("[エラー] 右手把持座標が生成されていません")
+        if not self._loaded_plan and self._rh_base is None:
+            self._log("[エラー] 右手把持座標が生成されていません (または計画をロードしてください)")
             return
         self._set_state(S_MOVING)
         self._run_bg(
@@ -1799,22 +1801,22 @@ class SciurusGUI:
         )
 
     def _on_move_align_left(self):
-        if self._lh_base is None:
-            self._log("[エラー] 左手把持座標が生成されていません")
+        if not self._loaded_plan and self._lh_base is None:
+            self._log("[エラー] 左手把持座標が生成されていません (または計画をロードしてください)")
             return
         self._set_state(S_MOVING)
         self._run_bg(self._do_move_align_left, on_error_state=S_DONE)
 
     def _on_move_align_right(self):
-        if self._rh_base is None:
-            self._log("[エラー] 右手把持座標が生成されていません")
+        if not self._loaded_plan and self._rh_base is None:
+            self._log("[エラー] 右手把持座標が生成されていません (または計画をロードしてください)")
             return
         self._set_state(S_MOVING)
         self._run_bg(self._do_move_align_right, on_error_state=S_DONE)
 
     def _on_move_align_both(self):
-        if self._lh_base is None or self._rh_base is None:
-            self._log("[エラー] 把持座標が生成されていません")
+        if not self._loaded_plan and (self._lh_base is None or self._rh_base is None):
+            self._log("[エラー] 把持座標が生成されていません (または計画をロードしてください)")
             return
         self._set_state(S_MOVING)
         self._run_bg(self._do_move_align_both, on_error_state=S_DONE)
@@ -1835,7 +1837,13 @@ class SciurusGUI:
 
     def _exec_move_and_align(self, side: str):
         """グラスプ位置へ移動しながら j6→j7 を GL/GR 方向に揃える。"""
-        robot  = self._get_robot()
+        robot = self._get_robot()
+
+        if self._loaded_plan:
+            arm_group = self.args.l_arm_group if side == "left" else self.args.r_arm_group
+            self._do_exec_plan_filtered(robot, [arm_group], "align")
+            return
+
         plan_p = self._make_plan_params(robot, vel=0.05)
 
         if side == "left":
@@ -1944,9 +1952,33 @@ class SciurusGUI:
             on_error_state=S_DONE,
         )
 
+    def _do_exec_plan_filtered(self, robot, groups: list, label_filter: str | None = None) -> bool:
+        """_loaded_plan からグループ(と任意のラベル条件)でフィルタしたアームステップを実行する。"""
+        steps = [
+            s for s in self._loaded_plan
+            if s.get("type") == "arm"
+            and s.get("group") in groups
+            and (label_filter is None or label_filter in s.get("label", ""))
+        ]
+        if not steps:
+            self._log(f"[計画実行] 対象ステップなし (groups={groups}, filter={label_filter})")
+            return False
+        total = len(steps)
+        self._log(f"[計画実行] {total} ステップを実行します")
+        for i, step in enumerate(steps):
+            self._log(f"  {i+1}/{total}: {step['label']} [{step.get('group','-')}]")
+            robot.execute(step["trajectory"], controllers=[])
+            time.sleep(0.5)
+        self._log(f"[計画実行完了] {total} ステップ")
+        return True
+
     def _do_move(self):
         """両アームを把持位置へ移動する。"""
         robot = self._get_robot()
+        if self._loaded_plan:
+            self._do_exec_plan_filtered(robot, [self.args.l_arm_group, self.args.r_arm_group])
+            self.root.after(0, lambda: self._set_state(S_DONE))
+            return
         log   = self._log
         l_arm     = robot.get_planning_component(self.args.l_arm_group)
         r_arm     = robot.get_planning_component(self.args.r_arm_group)
@@ -2051,11 +2083,19 @@ class SciurusGUI:
 
     def _do_move_left(self):
         robot = self._get_robot()
+        if self._loaded_plan:
+            self._do_exec_plan_filtered(robot, [self.args.l_arm_group])
+            self.root.after(0, lambda: self._set_state(S_DONE))
+            return
         self._move_single_arm(robot, "left")
         self.root.after(0, lambda: self._set_state(S_DONE))
 
     def _do_move_right(self):
         robot = self._get_robot()
+        if self._loaded_plan:
+            self._do_exec_plan_filtered(robot, [self.args.r_arm_group])
+            self.root.after(0, lambda: self._set_state(S_DONE))
+            return
         self._move_single_arm(robot, "right")
         self.root.after(0, lambda: self._set_state(S_DONE))
 
@@ -2300,6 +2340,11 @@ class SciurusGUI:
             self._refresh_ui()
         except Exception as e:
             self._log(f"[計画読み込みエラー] {e}")
+
+    def _on_clear_plan(self):
+        self._loaded_plan.clear()
+        self._log("[計画クリア] ロード済み計画をリセットしました — 通常再計画モードに戻ります")
+        self._refresh_ui()
 
     def _on_exec_plan(self):
         if not self._loaded_plan:
