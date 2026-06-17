@@ -2391,7 +2391,7 @@ class SciurusGUI:
             steps = []
             for s in raw:
                 step = dict(s)
-                if step.get("type") == "arm" and isinstance(step.get("trajectory"), bytes):
+                if step.get("type") in ("arm", "waist") and isinstance(step.get("trajectory"), bytes):
                     step["trajectory"] = deserialize_message(step["trajectory"], RobotTrajectory)
                 steps.append(step)
             self._loaded_plan = steps
@@ -2419,6 +2419,12 @@ class SciurusGUI:
             if step["type"] == "arm":
                 robot.execute(step["trajectory"], controllers=[])
                 time.sleep(0.5)
+            elif step["type"] == "waist":
+                robot.execute(step["trajectory"], controllers=[])
+                self._waist_angle_rad = math.radians(
+                    float(label.split()[-2]) if len(label.split()) >= 2 else 0.0
+                ) if "deg" in label else 0.0
+                time.sleep(0.3)
             elif step["type"] == "gripper":
                 self._log(f"  → グリッパステップはスキップ (手動操作): {label}")
         self._log("[計画実行完了]")
