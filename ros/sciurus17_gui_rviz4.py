@@ -1293,6 +1293,14 @@ class SciurusRvizGUI:
         tk.Frame(f5_col0, height=1, bg="#555555").pack(fill=tk.X, pady=3)
         add_btn(f5_col0, "⊕  関節マーカ更新",  self._on_joint_markers, "joint_markers", color="#5a4a2a")
         tk.Frame(f5_col0, height=1, bg="#555555").pack(fill=tk.X, pady=3)
+        save_row = tk.Frame(f5_col0, bg=PANEL_BG)
+        save_row.pack(fill=tk.X, pady=(2, 0))
+        tk.Label(save_row, text="保存先:", bg=PANEL_BG, fg="#aaaaaa",
+                 font=("Helvetica", 8)).pack(side=tk.LEFT)
+        self._save_path_var = tk.StringVar(value="/tmp/grasp_plan.plan")
+        tk.Entry(save_row, textvariable=self._save_path_var,
+                 bg="#444444", fg="white", font=("Courier", 8),
+                 width=22).pack(side=tk.LEFT, padx=2, fill=tk.X, expand=True)
         add_btn(f5_col0, "↓  計画を保存",  self._on_save_plan,  "save_plan",  color="#5a4a1a")
         add_btn(f5_col0, "↺  計画クリア",  self._on_clear_plan, "clear_plan", color="#5a3a1a")
 
@@ -2281,18 +2289,17 @@ class SciurusRvizGUI:
     # ──────────────────────── 計画保存 ─────────────────────────────────────────
 
     def _on_save_plan(self):
+        import tkinter.messagebox as mb
         if not self._plan_steps:
+            mb.showwarning("計画保存", "保存する計画がありません。\n移動ボタンで計画を実行してから保存してください。",
+                           parent=self.root)
             self._log("[計画保存] 保存する計画がありません。移動ボタンで計画を実行してから保存してください。")
             return
-        from tkinter import filedialog
-        path = filedialog.asksaveasfilename(
-            defaultextension=".plan",
-            filetypes=[("Plan file", "*.plan"), ("All files", "*.*")],
-            initialfile="grasp_plan.plan",
-            title="計画ファイルを保存",
-        )
+        path = self._save_path_var.get().strip()
         if not path:
+            mb.showwarning("計画保存", "保存先パスを入力してください。", parent=self.root)
             return
+        self._log(f"[計画保存] {path} に保存中 ({len(self._plan_steps)} ステップ)...")
         self._run_bg(lambda: self._do_save_plan(path))
 
     def _do_save_plan(self, path: str):
