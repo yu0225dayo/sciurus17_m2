@@ -1162,6 +1162,14 @@ class SciurusGUI:
         add_btn(f5_col0, "⌂  右初期姿勢",       self._on_home_right, "home_right")
         add_btn(f5_col0, "⊕  関節マーカ更新",   self._on_joint_markers, "joint_markers", color="#5a4a2a")
         tk.Frame(f5_col0, height=1, bg="#555555").pack(fill=tk.X, pady=3)
+        load_row = tk.Frame(f5_col0, bg=PANEL_BG)
+        load_row.pack(fill=tk.X, pady=(2, 0))
+        tk.Label(load_row, text="計画ファイル:", bg=PANEL_BG, fg="#aaaaaa",
+                 font=("Helvetica", 8)).pack(side=tk.LEFT)
+        self._load_path_var = tk.StringVar(value="/sciurus17_m2/grasp_plan.plan")
+        tk.Entry(load_row, textvariable=self._load_path_var,
+                 bg="#444444", fg="white", font=("Courier", 8),
+                 width=22).pack(side=tk.LEFT, padx=2, fill=tk.X, expand=True)
         add_btn(f5_col0, "↑  計画を読み込み",  self._on_load_plan,   "load_plan",   color="#4a5a1a")
         add_btn(f5_col0, "▷  計画を全実行",   self._on_exec_plan,   "exec_plan",   color="#3a5a1a")
         add_btn(f5_col0, "↺  計画クリア",     self._on_clear_plan,  "clear_plan",  color="#5a3a1a")
@@ -2314,12 +2322,10 @@ class SciurusGUI:
     # ──────────────────────── 計画ロード実行 ───────────────────────────────────
 
     def _on_load_plan(self):
-        from tkinter import filedialog
-        path = filedialog.askopenfilename(
-            filetypes=[("Plan file", "*.plan"), ("All files", "*.*")],
-            title="計画ファイルを開く",
-        )
+        path = self._load_path_var.get().strip()
         if not path:
+            import tkinter.messagebox as mb
+            mb.showwarning("計画読み込み", "計画ファイルのパスを入力してください。", parent=self.root)
             return
         try:
             import pickle
@@ -2330,7 +2336,7 @@ class SciurusGUI:
             steps = []
             for s in raw:
                 step = dict(s)
-                if step.get("type") == "arm" and isinstance(step.get("trajectory"), bytes):
+                if step.get("type") in ("arm", "waist") and isinstance(step.get("trajectory"), bytes):
                     step["trajectory"] = deserialize_message(step["trajectory"], RobotTrajectory)
                 steps.append(step)
             self._loaded_plan = steps
