@@ -1646,15 +1646,20 @@ class SciurusGUI:
             self.args.camera_frame, self.args.base_frame,
         )
 
-        # ゴール中指方向マーカ
+        # ゴール中指方向マーカ (手首→中指指先 joint20 を使用)
         try:
             lh_goal_xaxis = rh_goal_xaxis = None
-            if self._lh_cam_all is not None and self._lh_cam_all.shape[0] >= 15:
-                R_lh = _R_CAM_OPT_TO_BASE @ _compute_palm_frame(self._lh_cam_all, flip_z=False)
-                lh_goal_xaxis = R_lh[:, 0]
-            if self._rh_cam_all is not None and self._rh_cam_all.shape[0] >= 15:
-                R_rh = _R_CAM_OPT_TO_BASE @ _compute_palm_frame(self._rh_cam_all, flip_z=True)
-                rh_goal_xaxis = R_rh[:, 0]
+            _J_MID_TIP = 20
+            if self._lh_cam_all is not None and self._lh_cam_all.shape[0] > _J_MID_TIP:
+                v = self._lh_cam_all[_J_MID_TIP] - self._lh_cam_all[0]
+                n = np.linalg.norm(v)
+                if n > 1e-6:
+                    lh_goal_xaxis = _R_CAM_OPT_TO_BASE @ (v / n)
+            if self._rh_cam_all is not None and self._rh_cam_all.shape[0] > _J_MID_TIP:
+                v = self._rh_cam_all[_J_MID_TIP] - self._rh_cam_all[0]
+                n = np.linalg.norm(v)
+                if n > 1e-6:
+                    rh_goal_xaxis = _R_CAM_OPT_TO_BASE @ (v / n)
             self._lh_goal_xaxis = lh_goal_xaxis
             self._rh_goal_xaxis = rh_goal_xaxis
             self.node.publish_goal_direction_markers(lh_base, rh_base,
