@@ -973,25 +973,6 @@ class RvizRobotNode(Node):
                         m.lifetime.sec = 0
                         arr.markers.append(m)
 
-                        # ラベル
-                        t = Marker()
-                        t.header.frame_id = "base_link"
-                        t.header.stamp = now
-                        t.ns = "joint_label"
-                        t.id = mid
-                        t.type = Marker.TEXT_VIEW_FACING
-                        t.action = Marker.ADD
-                        t.pose.position.x = x
-                        t.pose.position.y = y
-                        t.pose.position.z = z + 0.04
-                        t.pose.orientation.w = 1.0
-                        t.scale.z = 0.025
-                        t.color.r = t.color.g = t.color.b = 1.0
-                        t.color.a = 1.0
-                        t.text = f"{prefix.upper()}{i}({x:+.2f},{y:+.2f},{z:+.2f})"
-                        t.lifetime.sec = 0
-                        arr.markers.append(t)
-
                         mid += 1
 
             self._pub_joint_markers.publish(arr)
