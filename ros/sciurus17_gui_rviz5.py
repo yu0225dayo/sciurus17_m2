@@ -705,24 +705,6 @@ class RvizRobotNode(Node):
             m.lifetime.sec = 0
             arr.markers.append(m)
 
-            # テキストラベル (球の少し上)
-            t = Marker()
-            t.header.frame_id = "base_link"
-            t.header.stamp    = now
-            t.ns              = "grasp_label"
-            t.id              = idx
-            t.type            = Marker.TEXT_VIEW_FACING
-            t.action          = Marker.ADD
-            t.pose.position.x = float(xyz[0])
-            t.pose.position.y = float(xyz[1])
-            t.pose.position.z = float(xyz[2]) + 0.07
-            t.pose.orientation.w = 1.0
-            t.scale.z         = 0.04
-            t.color.r = t.color.g = t.color.b = 1.0; t.color.a = 1.0
-            t.text            = f"{label}[{xyz[0]:+.2f},{xyz[1]:+.2f},{xyz[2]:+.2f}]"
-            t.lifetime.sec    = 0
-            arr.markers.append(t)
-
         self._pub_markers.publish(arr)
         self.get_logger().info("[marker] 把持目標マーカを /grasp_markers へ配信しました")
 
@@ -777,23 +759,6 @@ class RvizRobotNode(Node):
                 m.color.r = r; m.color.g = g; m.color.b = b; m.color.a = 0.9
                 m.lifetime.sec = 0
                 arr.markers.append(m)
-
-                t = Marker()
-                t.header.frame_id = "base_link"
-                t.header.stamp    = now
-                t.ns              = "hand_kp_label"
-                t.id              = mid
-                t.type            = Marker.TEXT_VIEW_FACING
-                t.action          = Marker.ADD
-                t.pose.position.x = float(xyz_base[0])
-                t.pose.position.y = float(xyz_base[1])
-                t.pose.position.z = float(xyz_base[2]) + 0.04
-                t.pose.orientation.w = 1.0
-                t.scale.z         = 0.025
-                t.color.r = t.color.g = t.color.b = 1.0; t.color.a = 1.0
-                t.text            = f"{hand_prefix}_{kp_label}"
-                t.lifetime.sec    = 0
-                arr.markers.append(t)
                 mid += 1
 
         self._pub_markers.publish(arr)
