@@ -34,6 +34,8 @@ try:
     import rclpy.time
     from rclpy.node import Node
     from sensor_msgs.msg import JointState
+    from geometry_msgs.msg import Point
+    from visualization_msgs.msg import Marker, MarkerArray
 except ImportError as e:
     print(f"[エラー] ROS2 が見つかりません: {e}")
     sys.exit(1)
@@ -71,6 +73,7 @@ class MonitorNode(Node):
         self._sub = self.create_subscription(
             JointState, "/joint_states", self._cb_joint, 10
         )
+        self._pub_traj = self.create_publisher(MarkerArray, "/joint7_trajectory", 10)
         self._tf_buf = None
         if _TF2_OK:
             self._tf_buf = Buffer()
@@ -96,6 +99,59 @@ class MonitorNode(Node):
                 result[link] = None
         return result
 
+    def publish_joint7_trail(
+        self,
+        traj_l: "list[np.ndarray]",
+        traj_r: "list[np.ndarray]",
+    ):
+        """l_link7 / r_link7 の軌跡を LINE_STRIP + 最新点球体で /joint7_trajectory へ配信。"""
+        arr = MarkerArray()
+        now = self.get_clock().now().to_msg()
+        entries = [
+            (0, traj_l, (0.2, 1.0, 0.2)),   # 左: 緑
+            (1, traj_r, (1.0, 0.3, 0.3)),   # 右: 赤
+        ]
+        for mid, traj, color in entries:
+            r, g, b = color
+            if len(traj) >= 2:
+                line = Marker()
+                line.header.frame_id = "base_link"
+                line.header.stamp    = now
+                line.ns              = "j7_trail"
+                line.id              = mid
+                line.type            = Marker.LINE_STRIP
+                line.action          = Marker.ADD
+                line.scale.x         = 0.005
+                line.color.r = r; line.color.g = g; line.color.b = b; line.color.a = 1.0
+                line.lifetime.sec    = 0
+                for pos in traj:
+                    line.points.append(Point(x=float(pos[0]), y=float(pos[1]), z=float(pos[2])))
+                arr.markers.append(line)
+            if traj:
+                sphere = Marker()
+                sphere.header.frame_id = "base_link"
+                sphere.header.stamp    = now
+                sphere.ns              = "j7_current"
+                sphere.id              = mid
+                sphere.type            = Marker.SPHERE
+                sphere.action          = Marker.ADD
+                sphere.pose.position.x = float(traj[-1][0])
+                sphere.pose.position.y = float(traj[-1][1])
+                sphere.pose.position.z = float(traj[-1][2])
+                sphere.pose.orientation.w = 1.0
+                sphere.scale.x = sphere.scale.y = sphere.scale.z = 0.022
+                sphere.color.r = r; sphere.color.g = g; sphere.color.b = b; sphere.color.a = 1.0
+                sphere.lifetime.sec = 0
+                arr.markers.append(sphere)
+        if arr.markers:
+            self._pub_traj.publish(arr)
+
+    def clear_j7_trail(self):
+        arr = MarkerArray()
+        m = Marker(); m.action = Marker.DELETEALL
+        arr.markers.append(m)
+        self._pub_traj.publish(arr)
+
 
 # ── GUI アプリ ─────────────────────────────────────────────────────────────────
 class RangeCheckRealApp:
@@ -107,7 +163,10 @@ class RangeCheckRealApp:
         self._log_rows: list[dict] = []
         self._joint_min: dict[str, float] = {}
         self._joint_max: dict[str, float] = {}
-        self._continuous = False
+        self._continuous   = False
+        self._track_j7     = False
+        self._traj_l: list[np.ndarray] = []
+        self._traj_r: list[np.ndarray] = []
 
         self._build_gui()
 
@@ -204,6 +263,19 @@ class RangeCheckRealApp:
                  ).pack(fill=tk.X, padx=6, pady=2)
         btn("CSV 保存", self._on_save_csv, "#2a3a5a")
 
+        sec("── joint7 軌跡記録 (RViz: /joint7_trajectory) ──")
+        self._j7_btn = btn("joint7 軌跡記録 開始", self._on_toggle_j7_track, "#3a1a5a")
+        btn("軌跡クリア", self._on_clear_j7_traj, "#3a2a4a")
+        self._j7_count_var = tk.StringVar(value="記録: 0 点")
+        tk.Label(parent, textvariable=self._j7_count_var,
+                 bg=PANEL_BG, fg="#aaaaaa", font=("Courier", 8)
+                 ).pack(anchor=tk.W, padx=8)
+        self._j7_save_var = tk.StringVar(value="/sciurus17_m2/joint7_traj.csv")
+        tk.Entry(parent, textvariable=self._j7_save_var,
+                 bg="#444444", fg="white", font=("Courier", 8)
+                 ).pack(fill=tk.X, padx=6, pady=2)
+        btn("軌跡 CSV 保存", self._on_save_j7_csv, "#2a2a5a")
+
         sec("── ログ ──")
         self._log_text = scrolledtext.ScrolledText(
             parent, bg=LOG_BG, fg=LOG_FG, font=("Courier", 8),
@@ -238,6 +310,15 @@ class RangeCheckRealApp:
 
         if self._continuous:
             self._do_record(jp, eef)
+
+        if self._track_j7:
+            if lp is not None:
+                self._traj_l.append(lp.copy())
+            if rp is not None:
+                self._traj_r.append(rp.copy())
+            n = max(len(self._traj_l), len(self._traj_r))
+            self._j7_count_var.set(f"記録: {n} 点")
+            self._node.publish_joint7_trail(self._traj_l, self._traj_r)
 
         self.root.after(150, self._update_loop)
 
@@ -333,8 +414,59 @@ class RangeCheckRealApp:
             self._log_text.config(state=tk.DISABLED)
         self.root.after(0, _up)
 
+    def _on_toggle_j7_track(self):
+        self._track_j7 = not self._track_j7
+        self._j7_btn.config(
+            text="joint7 軌跡記録 停止" if self._track_j7 else "joint7 軌跡記録 開始",
+            bg="#6600cc"              if self._track_j7 else "#3a1a5a",
+        )
+        self._log("joint7 軌跡記録 " + ("開始" if self._track_j7 else "停止"))
+
+    def _on_clear_j7_traj(self):
+        self._traj_l.clear()
+        self._traj_r.clear()
+        self._j7_count_var.set("記録: 0 点")
+        self._node.clear_j7_trail()
+        self._log("[軌跡クリア] joint7 軌跡をクリアしました")
+
+    def _on_save_j7_csv(self):
+        if not self._traj_l and not self._traj_r:
+            self._log("[軌跡CSV] 記録データがありません")
+            return
+        path = self._j7_save_var.get().strip()
+        n    = max(len(self._traj_l), len(self._traj_r))
+        rows = []
+        for i in range(n):
+            ts  = datetime.datetime.now().isoformat(timespec="milliseconds")
+            row: dict = {"index": i, "timestamp": ts}
+            if i < len(self._traj_l):
+                p = self._traj_l[i]
+                row["l_link7_x"] = f"{p[0]:.4f}"
+                row["l_link7_y"] = f"{p[1]:.4f}"
+                row["l_link7_z"] = f"{p[2]:.4f}"
+            else:
+                row["l_link7_x"] = row["l_link7_y"] = row["l_link7_z"] = ""
+            if i < len(self._traj_r):
+                p = self._traj_r[i]
+                row["r_link7_x"] = f"{p[0]:.4f}"
+                row["r_link7_y"] = f"{p[1]:.4f}"
+                row["r_link7_z"] = f"{p[2]:.4f}"
+            else:
+                row["r_link7_x"] = row["r_link7_y"] = row["r_link7_z"] = ""
+            rows.append(row)
+        try:
+            fields = list(rows[0].keys())
+            with open(path, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=fields)
+                w.writeheader()
+                w.writerows(rows)
+            self._log(f"[軌跡CSV保存完了] {len(rows)} 点 → {path}")
+        except Exception as e:
+            self._log(f"[軌跡CSV エラー] {e}")
+
     def _on_close(self):
         self._continuous = False
+        self._track_j7   = False
         rclpy.shutdown()
         self.root.destroy()
 

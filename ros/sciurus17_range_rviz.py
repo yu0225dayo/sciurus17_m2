@@ -237,6 +237,45 @@ class WorkspaceNode(Node):
 
         self._pub.publish(arr)
 
+    def publish_trajectory_line(self, positions: "list[np.ndarray]", color_rgb=(0.3, 1.0, 0.3)):
+        """スイープで得た EEF 軌跡を LINE_STRIP で /workspace_markers に配信。"""
+        if len(positions) < 2:
+            return
+        arr = MarkerArray()
+        now = self.get_clock().now().to_msg()
+        r, g, b = color_rgb
+        line = Marker()
+        line.header.frame_id = "base_link"
+        line.header.stamp    = now
+        line.ns              = "j7_sweep_line"
+        line.id              = 9000
+        line.type            = Marker.LINE_STRIP
+        line.action          = Marker.ADD
+        line.scale.x         = 0.007
+        line.color.r = r; line.color.g = g; line.color.b = b; line.color.a = 1.0
+        line.lifetime.sec    = 0
+        for pos in positions:
+            line.points.append(Point(x=float(pos[0]), y=float(pos[1]), z=float(pos[2])))
+        arr.markers.append(line)
+        # 始点・終点を目立たせる
+        for sphere_id, pos, alpha in [(9001, positions[0], 0.8), (9002, positions[-1], 1.0)]:
+            s = Marker()
+            s.header.frame_id = "base_link"
+            s.header.stamp    = now
+            s.ns              = "j7_sweep_ends"
+            s.id              = sphere_id
+            s.type            = Marker.SPHERE
+            s.action          = Marker.ADD
+            s.pose.position.x = float(pos[0])
+            s.pose.position.y = float(pos[1])
+            s.pose.position.z = float(pos[2])
+            s.pose.orientation.w = 1.0
+            s.scale.x = s.scale.y = s.scale.z = 0.025
+            s.color.r = r; s.color.g = g; s.color.b = b; s.color.a = alpha
+            s.lifetime.sec = 0
+            arr.markers.append(s)
+        self._pub.publish(arr)
+
     def clear_markers(self):
         arr = MarkerArray()
         m = Marker(); m.action = Marker.DELETEALL
@@ -392,7 +431,8 @@ class RangeCheckRvizApp:
                 positions = self._node.sweep_joint(group, j_idx, steps, vel, self._log)
                 if positions:
                     self._node.publish_workspace_markers(positions, color_rgb=(0.3, 1.0, 0.3))
-                    self._log(f"[スイープ完了] {len(positions)} 点 → /workspace_markers 配信")
+                    self._node.publish_trajectory_line(positions, color_rgb=(1.0, 0.9, 0.2))
+                    self._log(f"[スイープ完了] {len(positions)} 点 → /workspace_markers 配信 (軌跡LINE_STRIP付き)")
                     for pos in positions:
                         self._result_rows.append({
                             "type": "sweep", "group": group, "joint_index": j_idx,
