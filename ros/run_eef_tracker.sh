@@ -9,7 +9,7 @@ source /ros2_ws/install/setup.bash
 
 # demo をバックグラウンドで起動
 echo "=== demo.launch.py 起動中 ==="
-ros2 launch sciurus17_examples demo.launch.py use_mock_components:=true &
+ros2 launch sciurus17_examples demo.launch.py use_mock_components:=true use_head_camera:=false use_chest_camera:=false &
 DEMO_PID=$!
 
 # move_group ノードが現れるまで待機
