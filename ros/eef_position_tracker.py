@@ -38,8 +38,6 @@ except ImportError as e:
 try:
     from moveit.core.robot_state import RobotState, robotStateToRobotStateMsg
     from moveit.planning import MoveItPy
-    from ament_index_python.packages import get_package_share_directory
-    from moveit_configs_utils import MoveItConfigsBuilder
     _MOVEIT_OK = True
 except ImportError as e:
     print(f"[警告] MoveItPy 利用不可: {e}", flush=True)
@@ -71,23 +69,7 @@ class EefTracker(Node):
         if _MOVEIT_OK:
             print("[初期化] MoveItPy 起動中...", flush=True)
             try:
-                moveit_py_yaml = (
-                    get_package_share_directory("sciurus17_examples_py")
-                    + "/config/sciurus17_moveit_py_examples.yaml"
-                )
-                cfg = (
-                    MoveItConfigsBuilder("sciurus17")
-                    .planning_scene_monitor(
-                        publish_robot_description=True,
-                        publish_robot_description_semantic=True,
-                    )
-                    .moveit_cpp(file_path=moveit_py_yaml)
-                    .to_moveit_configs()
-                )
-                self._robot = MoveItPy(
-                    node_name="eef_tracker_moveit",
-                    config_dict=cfg.to_dict(),
-                )
+                self._robot = MoveItPy(node_name="eef_tracker_moveit")
                 print("[初期化] MoveItPy 完了", flush=True)
             except Exception as e:
                 print(f"[警告] MoveItPy 初期化失敗: {e}", flush=True)
