@@ -65,6 +65,13 @@ class EefTracker(Node):
         self._tf_buf = Buffer()
         self._tf_listener = TransformListener(self._tf_buf, self)
 
+        # DDS ディスカバリ + robot_description トピック受信待機
+        import time
+        print("[初期化] DDS ディスカバリ待機中 (8秒)...", flush=True)
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+
         # MoveItPy 初期化
         if _MOVEIT_OK:
             print("[初期化] MoveItPy 起動中...", flush=True)
@@ -75,7 +82,6 @@ class EefTracker(Node):
                 print(f"[警告] MoveItPy 初期化失敗: {e}", flush=True)
 
         # TF が届くまで待つ
-        import time
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline:
             rclpy.spin_once(self, timeout_sec=0.1)
