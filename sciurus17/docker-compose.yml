@@ -30,7 +30,7 @@ services:
     container_name: sciurus17_ros2_real
     devices:
       # symlink は Docker で解決されないため ttyUSB0 を直接 sciurus17spine にマッピング
-      - /dev/sciurus17spine:/dev/sciurus17spine
+      - /dev/ttyUSB0:/dev/sciurus17spine
       - /dev/bus/usb:/dev/bus/usb
       # RealSense UVC 制御に /dev/video* が必要
       - /dev/video0:/dev/video0

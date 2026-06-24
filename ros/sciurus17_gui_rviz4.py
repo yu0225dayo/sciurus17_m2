@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 sciurus17 把持コントロールパネル (tkinter GUI) — RViz 仮想モード
 

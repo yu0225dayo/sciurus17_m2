@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 sciurus17 把持コントロールパネル (tkinter GUI) — メインモード
 
@@ -1312,6 +1312,7 @@ class SciurusGUI:
             "move_align_right":  s == S_DONE and not w,
             "rotate_left":       s == S_DONE and not w,
             "rotate_right":      s == S_DONE and not w,
+            "reposition":        self._lh_base is not None and not w,
             "joint_markers":     can_arm,
             "g_open":            can_arm,
             "g_close":           can_arm,
@@ -2368,7 +2369,7 @@ class SciurusGUI:
         p.max_velocity_scaling_factor     = vel
         p.max_acceleration_scaling_factor = vel
         p.planning_time                   = planning_time
-        p.num_planning_attempts           = attempts
+        p.planning_attempts               = attempts
         return p
 
     # ──────────────────────── 終了処理 ─────────────────────────────────────────

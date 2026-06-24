@@ -74,23 +74,33 @@ class WorkspaceNode(Node):
         if self._robot is None:
             if not _MOVEIT_OK:
                 raise RuntimeError("MoveItPy が利用できません")
-            self._robot = MoveItPy(node_name="sciurus17_range_rviz")
+            from ament_index_python.packages import get_package_share_directory
+            from moveit_configs_utils import MoveItConfigsBuilder
+            moveit_py_yaml = (
+                get_package_share_directory("sciurus17_examples_py")
+                + "/config/sciurus17_moveit_py_examples.yaml"
+            )
+            cfg = (
+                MoveItConfigsBuilder("sciurus17")
+                .planning_scene_monitor(
+                    publish_robot_description=True,
+                    publish_robot_description_semantic=True,
+                )
+                .moveit_cpp(file_path=moveit_py_yaml)
+                .to_moveit_configs()
+            )
+            self._robot = MoveItPy(node_name="sciurus17_range_rviz",
+                                   config_dict=cfg.to_dict())
         return self._robot
 
     def get_joint_limits(self, group_name: str) -> list[tuple[str, float, float]]:
         """グループの (関節名, min_rad, max_rad) リストを返す。"""
-        robot   = self.get_robot()
-        model   = robot.get_robot_model()
-        jmg     = model.get_joint_model_group(group_name)
-        joints  = jmg.get_active_joint_model_names()
-        result  = []
-        for jn in joints:
-            jm     = model.get_joint_model(jn)
-            bounds = jm.get_variable_bounds()
-            lo = bounds[0].min_position if bounds else -math.pi
-            hi = bounds[0].max_position if bounds else  math.pi
-            result.append((jn, lo, hi))
-        return result
+        robot  = self.get_robot()
+        model  = robot.get_robot_model()
+        jmg    = model.get_joint_model_group(group_name)
+        names  = list(jmg.active_joint_model_names)
+        bounds = jmg.active_joint_model_bounds
+        return [(jn, b[0].min_position, b[0].max_position) for jn, b in zip(names, bounds)]
 
     def fk_eef(self, group_name: str, joint_angles: list[float]) -> "np.ndarray | None":
         """関節角度から EEF (l_link7 / r_link7) の XYZ を返す。"""
@@ -121,13 +131,13 @@ class WorkspaceNode(Node):
         limits  = self.get_joint_limits(group_name)
         jname, lo, hi = limits[joint_index]
         jmg     = model.get_joint_model_group(group_name)
-        all_jnames = list(jmg.get_active_joint_model_names())
+        all_jnames = list(jmg.active_joint_model_names)
 
         log_fn(f"[スイープ] {jname}  {math.degrees(lo):.1f}° → {math.degrees(hi):.1f}°  {n_steps}ステップ")
 
         eef_link = EEF_LINK_MAP.get(group_name, "l_link7")
         comp     = robot.get_planning_component(group_name)
-        plan_p   = PlanRequestParameters(robot, "ompl_rrtc")
+        plan_p   = PlanRequestParameters(robot, "ompl_rrtc_default")
         plan_p.max_velocity_scaling_factor    = vel
         plan_p.max_acceleration_scaling_factor = vel
 

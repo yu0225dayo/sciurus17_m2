@@ -191,6 +191,7 @@ class RangeCheckRealApp:
         self._build_controls(right)
 
         self.root.after(150, self._update_loop)
+        self.root.after(200, self._open_log_window)
 
     def _build_joint_table(self, parent):
         tk.Label(parent, text="関節角度 (リアルタイム)",
@@ -277,11 +278,7 @@ class RangeCheckRealApp:
         btn("軌跡 CSV 保存", self._on_save_j7_csv, "#2a2a5a")
 
         sec("── ログ ──")
-        self._log_text = scrolledtext.ScrolledText(
-            parent, bg=LOG_BG, fg=LOG_FG, font=("Courier", 8),
-            state=tk.DISABLED,
-        )
-        self._log_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        btn("ログウィンドウを開く", self._open_log_window, "#2a2a4a")
 
     # ── 定期更新 ────────────────────────────────────────────────────────────────
     def _update_loop(self):
@@ -408,6 +405,8 @@ class RangeCheckRealApp:
         ts   = datetime.datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}\n"
         def _up():
+            if not hasattr(self, "_log_text"):
+                return
             self._log_text.config(state=tk.NORMAL)
             self._log_text.insert(tk.END, line)
             self._log_text.see(tk.END)
@@ -463,6 +462,22 @@ class RangeCheckRealApp:
             self._log(f"[軌跡CSV保存完了] {len(rows)} 点 → {path}")
         except Exception as e:
             self._log(f"[軌跡CSV エラー] {e}")
+
+    def _open_log_window(self):
+        if hasattr(self, "_log_win") and self._log_win.winfo_exists():
+            self._log_win.deiconify()
+            self._log_win.lift()
+            return
+        self._log_win = tk.Toplevel(self.root)
+        self._log_win.title("ログ — sciurus17 可動域調査")
+        self._log_win.geometry("680x420")
+        self._log_win.configure(bg=BG)
+        self._log_win.protocol("WM_DELETE_WINDOW", self._log_win.withdraw)
+        self._log_text = scrolledtext.ScrolledText(
+            self._log_win, bg=LOG_BG, fg=LOG_FG, font=("Courier", 9),
+            state=tk.DISABLED,
+        )
+        self._log_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
     def _on_close(self):
         self._continuous = False
